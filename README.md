@@ -1,12 +1,12 @@
 # Nookwire SSH
 
-Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and [srv.us](https://docs.srv.us/) for a stable, key-derived public TLS endpoint.
+Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and a pluggable public ingress: [srv.us](https://docs.srv.us/) by default, or a Cloudflare Worker relay, or Cloudflare Tunnel (`cloudflared`).
 
-The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt.
+The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. The ingress only carries bytes, so host-key and password or public-key authentication are enforced end to end regardless of backend.
 
 ## Prerequisites
 
-The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`. A connecting machine needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support.
+The remote machine needs Python 3 and uv. The default `srvus` backend also needs OpenSSH and `ssh-keygen`; the `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support; `cloudflare` needs OpenSSH, uv, and Nookwire SSH installed (its `proxy` subcommand is the ProxyCommand); `cloudflared` needs OpenSSH and `cloudflared`.
 
 ## Install
 
@@ -14,7 +14,9 @@ The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`. A connecting m
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-Run it on the remote machine you want to expose. It installs the version-pinned `v1.2.1` files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+Run it on the remote machine you want to expose. It installs the version-pinned `v1.3.0` files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+
+Once installed, `nookwire-ssh upgrade` re-runs the installer in place (`nookwire-ssh upgrade REF` pins a branch or tag; default `main`). Restart a running server with `stop` then `start` to pick up the new code.
 
 Any arguments after `--` are passed to `nookwire-ssh`, so a single command can install and start in one go. Exposing the current directory:
 
@@ -44,7 +46,7 @@ When `start` runs interactively and `~/.ssh/authorized_keys` is empty or missing
 
 ## Start
 
-Start AsyncSSH and the srv.us tunnel together in the background:
+Start AsyncSSH and the tunnel together in the background. The default backend is srv.us; see [Backends](#backends) for the Cloudflare options.
 
 ```sh
 nookwire-ssh start
@@ -76,9 +78,49 @@ nookwire-ssh stop
 
 The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gives srv.us a stable hostname. Runtime state, credentials, PID files, and logs are stored under `~/.local/state/nookwire-ssh` by default.
 
+## Backends
+
+`start --backend` selects the public ingress. The AsyncSSH server is identical across all three; only the tunnel process and the printed connect command change. `status` reports the right command for whichever backend is running.
+
+### srvus (default)
+
+Reverse tunnel over srv.us. Zero account, zero domain; the connecting machine needs only OpenSSH and OpenSSL. See [Connect through TLS](#connect-through-tls).
+
+```sh
+nookwire-ssh start --backend srvus --slot 1
+```
+
+### cloudflare (Worker relay)
+
+Skips srv.us using a Cloudflare Worker you deploy once, which relays SSH over WebSockets via a Durable Object. The remote machine dials out to the Worker (no inbound ports), so it stays NAT-friendly. Deploy the Worker in [`worker/`](worker/README.md):
+
+```sh
+cd worker && npx wrangler deploy
+```
+
+Then start with the deployed URL as `--endpoint`:
+
+```sh
+nookwire-ssh start --backend cloudflare \
+  --endpoint https://nookwire-ssh-relay.<subdomain>.workers.dev
+```
+
+`status` prints an `ssh` command whose `ProxyCommand` is `nookwire-ssh proxy <wss-url>`. The connecting machine just installs Nookwire SSH the same way (the curl installer, which also drops `nookwire_ws.py` next to the launcher) and needs `uv` on `PATH`; no script paths to hand-edit. A per-start high-entropy tunnel id in the URL authorizes the session. Billing stays inside the free tier for interactive use: WebSocket messages bill at a 20:1 ratio and hibernation zeroes idle duration.
+
+### cloudflared (Cloudflare Tunnel)
+
+Uses `cloudflared` with no per-message billing. Configure a named tunnel whose ingress maps a hostname to `tcp://localhost:PORT`, then pass the hostname and connector token (or set `NOOKWIRE_CLOUDFLARED_TOKEN`):
+
+```sh
+nookwire-ssh start --backend cloudflared \
+  --hostname ssh.example.com --token "$CF_TUNNEL_TOKEN"
+```
+
+The connecting machine uses `ssh -o ProxyCommand='cloudflared access ssh --hostname %h'`, which `status` prints filled in.
+
 ## Connect through TLS
 
-srv.us wraps non-HTTP traffic in TLS. `start` and `status` print the SSH form below with the real username and hostname filled in; the username is the host's OS account. Replace `USER` and `HOSTNAME.srv.us` manually for SFTP or SCP:
+The `srvus` backend wraps non-HTTP traffic in TLS. `start` and `status` print the SSH form below with the real username and hostname filled in; the username is the host's OS account. Replace `USER` and `HOSTNAME.srv.us` manually for SFTP or SCP:
 
 ```sh
 ssh -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \

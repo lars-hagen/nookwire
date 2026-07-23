@@ -13,18 +13,33 @@ usage() {
   cat <<'EOF'
 Usage: nookwire-ssh COMMAND [ARGS]
 
-  start [DIR] [--port PORT] [--slot SLOT]
+  start [DIR] [--port PORT] [--slot SLOT] [--backend srvus|cloudflare|cloudflared]
+              [--endpoint URL] [--hostname HOST] [--token TOKEN]
   status
   logs [all|server|tunnel] [-f]
   stop
+  proxy WSS_URL
+  upgrade [REF]
 
-start launches AsyncSSH and srv.us in the background, exposing DIR
-(default: current directory) on PORT (default 8022) through srv.us slot
-SLOT (default 1). PORT and SLOT may also be given positionally, so
-"start", "start .", and "start /path 8022 1" all work.
-status prints processes, credentials, and the srv.us URL when available.
+start launches AsyncSSH plus a public tunnel in the background, exposing DIR
+(default: current directory) on PORT (default 8022). PORT and SLOT may also be
+given positionally, so "start", "start .", and "start /path 8022 1" all work.
+
+Backends select the ingress:
+  srvus       (default) reverse tunnel over srv.us slot SLOT (default 1).
+  cloudflare  outbound WebSocket to a Cloudflare Worker relay; needs --endpoint
+              (the deployed Worker URL). See worker/README.md.
+  cloudflared Cloudflare Tunnel; needs --hostname and --token (or
+              NOOKWIRE_CLOUDFLARED_TOKEN), with the tunnel ingress mapped to
+              tcp://localhost:PORT.
+
+status prints processes, credentials, and the connection command when available.
 logs shows the last 100 log lines; add -f to follow.
 stop terminates both background processes.
+proxy bridges stdin/stdout to the cloudflare relay at WSS_URL; it is used as an
+ssh ProxyCommand on the connecting machine (status prints the exact command).
+upgrade re-runs the installer from REF (default main) to update in place; restart
+any running server with stop then start to pick up new code.
 EOF
 }
 
@@ -149,6 +164,85 @@ extract_host() {
   python3 -c 'import pathlib,re,sys; m=re.findall(r"https://([A-Za-z0-9.-]+\.srv\.us)/?", pathlib.Path(sys.argv[1]).read_text(errors="replace")); print(m[-1] if m else "")' "$TUNNEL_LOG"
 }
 
+meta_get() {
+  [ -f "$STATE_DIR/meta" ] || return 0
+  python3 -c 'import sys,pathlib
+key=sys.argv[1]
+for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
+    if line.startswith(key + "="):
+        print(line[len(key) + 1:]); break' "$1" "$STATE_DIR/meta"
+}
+
+normalize_endpoint() {
+  python3 -c 'import sys
+value=sys.argv[1].strip().rstrip("/")
+scheme=sys.argv[2]
+for prefix in ("https://", "http://", "wss://", "ws://"):
+    if value.startswith(prefix):
+        value = value[len(prefix):]; break
+value or sys.exit(1)
+print(scheme + "://" + value)' "$1" "$2"
+}
+
+render_srvus_connect() {
+  ssh_user=$1
+  host=$(extract_host 2>/dev/null || true)
+  if [ -n "$host" ]; then
+    printf 'url: https://%s/\n' "$host"
+    cat <<EOF
+ssh:
+ssh \\
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  $ssh_user@$host
+EOF
+  else
+    printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
+  fi
+}
+
+render_cloudflare_connect() {
+  ssh_user=$1
+  endpoint=$(meta_get endpoint)
+  session=$(meta_get session)
+  if [ -z "$endpoint" ] || [ -z "$session" ]; then
+    printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
+    return
+  fi
+  wss=$(normalize_endpoint "$endpoint" wss 2>/dev/null || printf '%s' "$endpoint")
+  https=$(normalize_endpoint "$endpoint" https 2>/dev/null || printf '%s' "$endpoint")
+  printf 'url: %s/tunnel/%s\n' "$https" "$session"
+  cat <<EOF
+ssh:
+ssh \\
+  -o 'ProxyCommand=nookwire-ssh proxy $wss/tunnel/$session' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  $ssh_user@nookwire
+EOF
+  printf 'note: on the connecting machine, install nookwire-ssh (needs uv on PATH).\n'
+}
+
+render_cloudflared_connect() {
+  ssh_user=$1
+  hostname=$(meta_get hostname)
+  if [ -z "$hostname" ]; then
+    printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
+    return
+  fi
+  printf 'url: ssh://%s (via cloudflared)\n' "$hostname"
+  cat <<EOF
+ssh:
+ssh \\
+  -o 'ProxyCommand=cloudflared access ssh --hostname %h' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  $ssh_user@$hostname
+EOF
+  printf 'note: the connecting machine needs cloudflared installed.\n'
+}
+
 show_status() {
   if is_running "$SERVER_PID_FILE"; then
     printf 'server: running (pid %s)\n' "$(read_pid "$SERVER_PID_FILE")"
@@ -171,21 +265,89 @@ show_status() {
   else
     printf 'key auth: disabled; add keys to ~/.ssh/authorized_keys\n'
   fi
-  host=$(extract_host 2>/dev/null || true)
-  if [ -n "$host" ]; then
-    printf 'url: https://%s/\n' "$host"
-    cat <<EOF
-ssh:
-ssh \\
-  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
-  -o StrictHostKeyChecking=no \\
-  -o UserKnownHostsFile=/dev/null \\
-  $ssh_user@$host
-EOF
-  else
-    printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
-  fi
+  backend=$(meta_get backend)
+  [ -n "$backend" ] || backend=srvus
+  case "$backend" in
+    cloudflare) render_cloudflare_connect "$ssh_user" ;;
+    cloudflared) render_cloudflared_connect "$ssh_user" ;;
+    *) render_srvus_connect "$ssh_user" ;;
+  esac
   [ "$server_ok" -eq 1 ] && [ "$tunnel_ok" -eq 1 ]
+}
+
+launch_tunnel_srvus() {
+  command -v ssh >/dev/null 2>&1 || { stop_one "$SERVER_PID_FILE"; die "ssh is required for the srvus backend"; }
+  command -v ssh-keygen >/dev/null 2>&1 || { stop_one "$SERVER_PID_FILE"; die "ssh-keygen is required for the srvus backend"; }
+  if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
+    stop_one "$SERVER_PID_FILE"
+    die "Unable to prepare $HOME/.ssh"
+  fi
+  if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+    if ! ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"; then
+      stop_one "$SERVER_PID_FILE"
+      die "Unable to create the srv.us tunnel key"
+    fi
+  fi
+  nohup ssh \
+    -i "$HOME/.ssh/id_ed25519" \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    srv.us -R "$slot:127.0.0.1:$port" \
+    >"$TUNNEL_LOG" 2>&1 </dev/null &
+  tunnel_pid=$!
+}
+
+launch_tunnel_cloudflare() {
+  [ -n "$endpoint" ] || { stop_one "$SERVER_PID_FILE"; die "--endpoint is required for the cloudflare backend"; }
+  ws_script=$here/nookwire_ws.py
+  [ -f "$ws_script" ] || { stop_one "$SERVER_PID_FILE"; die "Missing $ws_script (needed for the cloudflare backend)"; }
+  wss=$(normalize_endpoint "$endpoint" wss) || { stop_one "$SERVER_PID_FILE"; die "Invalid --endpoint: $endpoint"; }
+  base_url=$wss/tunnel/$session
+  nohup uv run --with websockets python "$ws_script" origin \
+    --host 127.0.0.1 --port "$port" "$base_url" \
+    >"$TUNNEL_LOG" 2>&1 </dev/null &
+  tunnel_pid=$!
+}
+
+launch_tunnel_cloudflared() {
+  command -v cloudflared >/dev/null 2>&1 || { stop_one "$SERVER_PID_FILE"; die "cloudflared is required for the cloudflared backend"; }
+  [ -n "$hostname" ] || { stop_one "$SERVER_PID_FILE"; die "--hostname is required for the cloudflared backend"; }
+  token=${token:-${NOOKWIRE_CLOUDFLARED_TOKEN:-}}
+  [ -n "$token" ] || { stop_one "$SERVER_PID_FILE"; die "--token or NOOKWIRE_CLOUDFLARED_TOKEN is required for the cloudflared backend"; }
+  nohup cloudflared tunnel run --token "$token" \
+    >"$TUNNEL_LOG" 2>&1 </dev/null &
+  tunnel_pid=$!
+}
+
+backend_launch_tunnel() {
+  case "$backend" in
+    srvus) launch_tunnel_srvus ;;
+    cloudflare) launch_tunnel_cloudflare ;;
+    cloudflared) launch_tunnel_cloudflared ;;
+    *) stop_one "$SERVER_PID_FILE"; die "Unknown backend: $backend" ;;
+  esac
+}
+
+write_meta() {
+  {
+    printf 'backend=%s\n' "$backend"
+    printf 'port=%s\n' "$port"
+    case "$backend" in
+      cloudflare)
+        printf 'endpoint=%s\n' "$endpoint"
+        printf 'session=%s\n' "$session"
+        printf 'ws_script=%s\n' "$ws_script"
+        ;;
+      cloudflared)
+        printf 'hostname=%s\n' "$hostname"
+        ;;
+    esac
+  } > "$STATE_DIR/meta"
 }
 
 command=${1:-help}
@@ -196,6 +358,12 @@ case "$command" in
     root_arg=.
     port_arg=8022
     slot_arg=1
+    backend=srvus
+    endpoint=
+    hostname=
+    token=
+    session=
+    ws_script=
     posn=0
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -203,6 +371,14 @@ case "$command" in
         --port=*) port_arg=${1#*=} ;;
         -s|--slot) shift; [ $# -ge 1 ] || die "--slot needs a value"; slot_arg=$1 ;;
         --slot=*) slot_arg=${1#*=} ;;
+        --backend) shift; [ $# -ge 1 ] || die "--backend needs a value"; backend=$1 ;;
+        --backend=*) backend=${1#*=} ;;
+        --endpoint) shift; [ $# -ge 1 ] || die "--endpoint needs a value"; endpoint=$1 ;;
+        --endpoint=*) endpoint=${1#*=} ;;
+        --hostname) shift; [ $# -ge 1 ] || die "--hostname needs a value"; hostname=$1 ;;
+        --hostname=*) hostname=${1#*=} ;;
+        --token) shift; [ $# -ge 1 ] || die "--token needs a value"; token=$1 ;;
+        --token=*) token=${1#*=} ;;
         -h|--help) usage; exit 0 ;;
         -*) die "Unknown option: $1 (see nookwire-ssh help)" ;;
         *)
@@ -217,12 +393,14 @@ case "$command" in
       esac
       shift
     done
+    case "$backend" in
+      srvus|cloudflare|cloudflared) ;;
+      *) die "Unknown backend: $backend (use srvus, cloudflare, or cloudflared)" ;;
+    esac
     port=$(validate_port "$port_arg") || die "PORT must contain only ASCII digits and be from 1 to 65535"
     slot=$(validate_slot "$slot_arg") || die "SLOT must be a positive integer"
     root=$(CDPATH= cd "$root_arg" 2>/dev/null && pwd) || die "REMOTE_ROOT is not a directory: $root_arg"
     command -v uv >/dev/null 2>&1 || die "uv is required"
-    command -v ssh >/dev/null 2>&1 || die "ssh is required"
-    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
     here=$(CDPATH= cd "$(dirname "$0")" && pwd)
     server_script=$here/nookwire_ssh.py
     [ -f "$server_script" ] || die "Missing server companion: $server_script"
@@ -234,6 +412,7 @@ case "$command" in
     prompt_authorized_key
     password=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
     printf '%s' "$password" > "$PASSWORD_FILE"
+    session=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
     : > "$SERVER_LOG"
     : > "$TUNNEL_LOG"
     NOOKWIRE_SSH_PASSWORD=$password nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
@@ -262,33 +441,13 @@ case "$command" in
       tail -n 100 "$SERVER_LOG" >&2 || true
       exit 1
     fi
-    if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
-      stop_one "$SERVER_PID_FILE"
-      die "Unable to prepare $HOME/.ssh"
-    fi
-    if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
-      if ! ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"; then
-        stop_one "$SERVER_PID_FILE"
-        die "Unable to create the srv.us tunnel key"
-      fi
-    fi
-    nohup ssh \
-      -i "$HOME/.ssh/id_ed25519" \
-      -o IdentitiesOnly=yes \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR \
-      -o ExitOnForwardFailure=yes \
-      -o ServerAliveInterval=30 \
-      -o ServerAliveCountMax=3 \
-      srv.us -R "$slot:127.0.0.1:$port" \
-      >"$TUNNEL_LOG" 2>&1 </dev/null &
-    tunnel_pid=$!
+    backend_launch_tunnel
     write_pid "$tunnel_pid" "$TUNNEL_PID_FILE" || {
       stop_untracked_pid "$tunnel_pid"
       stop_one "$SERVER_PID_FILE"
       die "Unable to track tunnel process"
     }
+    write_meta
     sleep 2
     if ! is_running "$TUNNEL_PID_FILE"; then
       stop_one "$SERVER_PID_FILE"
@@ -328,7 +487,24 @@ case "$command" in
     setup_state
     stop_one "$TUNNEL_PID_FILE"
     stop_one "$SERVER_PID_FILE"
+    rm -f "$STATE_DIR/meta"
     printf 'Nookwire SSH stopped.\n'
+    ;;
+  proxy)
+    [ $# -eq 1 ] || die "Usage: nookwire-ssh proxy WSS_URL"
+    command -v uv >/dev/null 2>&1 || die "uv is required (https://docs.astral.sh/uv/)"
+    here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+    ws_script=$here/nookwire_ws.py
+    [ -f "$ws_script" ] || die "Missing $ws_script; reinstall nookwire-ssh"
+    exec uv run --with websockets python "$ws_script" client "$1"
+    ;;
+  upgrade)
+    [ $# -le 1 ] || die "Usage: nookwire-ssh upgrade [REF]"
+    command -v curl >/dev/null 2>&1 || die "curl is required to upgrade"
+    ref=${1:-main}
+    install_url=${NOOKWIRE_SSH_INSTALL_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/$ref/install.sh}
+    printf 'Upgrading nookwire-ssh from %s\n' "$install_url"
+    curl -fsSL "$install_url" | sh
     ;;
   help|-h|--help)
     usage

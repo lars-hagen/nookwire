@@ -1,0 +1,14 @@
+name = "nookwire-ssh-relay"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+# SQLite-backed Durable Objects are required on the Workers Free plan and
+# support the WebSocket Hibernation API used by the relay.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]

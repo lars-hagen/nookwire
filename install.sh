@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=${NOOKWIRE_SSH_VERSION:-1.2.1}
+VERSION=${NOOKWIRE_SSH_VERSION:-1.3.0}
 BASE_URL=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/v$VERSION}
 PREFIX=${NOOKWIRE_SSH_PREFIX:-"$HOME/.local"}
 BIN_DIR="$PREFIX/bin"
@@ -95,6 +95,15 @@ INSTALL_STARTED=1
 mv "$TEMP_DIR/nookwire-ssh" "$BIN_DIR/nookwire-ssh"
 mv "$TEMP_DIR/nookwire_ssh.py" "$BIN_DIR/nookwire_ssh.py"
 COMMITTED=1
+
+# Best-effort companion for the cloudflare backend; the srvus and cloudflared
+# backends do not need it, so a missing file must not fail the install.
+if [ ! -L "$BIN_DIR/nookwire_ws.py" ]; then
+  if curl -fsSL "$BASE_URL/nookwire_ws.py" -o "$TEMP_DIR/nookwire_ws.py" 2>/dev/null; then
+    chmod 644 "$TEMP_DIR/nookwire_ws.py"
+    mv "$TEMP_DIR/nookwire_ws.py" "$BIN_DIR/nookwire_ws.py"
+  fi
+fi
 
 printf 'Installed nookwire-ssh to %s\n' "$BIN_DIR/nookwire-ssh"
 case ":$PATH:" in
