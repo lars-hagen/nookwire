@@ -2,7 +2,7 @@
 
 Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and a pluggable public ingress: [srv.us](https://docs.srv.us/) by default, or a Cloudflare Worker relay, or Cloudflare Tunnel (`cloudflared`).
 
-The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. The ingress only carries bytes, so host-key and password or public-key authentication are enforced end to end regardless of backend.
+The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. Every backend only carries bytes and never terminates SSH, so SSH's own encryption and authentication run between client and server. As with srv.us, the printed connect commands disable host-key persistence for these disposable environments, so trust in the ingress matches the existing model; do not treat any backend as protection against a hostile relay.
 
 ## Prerequisites
 

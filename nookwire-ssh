@@ -319,7 +319,9 @@ launch_tunnel_cloudflared() {
   [ -n "$hostname" ] || { stop_one "$SERVER_PID_FILE"; die "--hostname is required for the cloudflared backend"; }
   token=${token:-${NOOKWIRE_CLOUDFLARED_TOKEN:-}}
   [ -n "$token" ] || { stop_one "$SERVER_PID_FILE"; die "--token or NOOKWIRE_CLOUDFLARED_TOKEN is required for the cloudflared backend"; }
-  nohup cloudflared tunnel run --token "$token" \
+  # Pass the token via the environment, not argv, so it is not exposed in
+  # process listings to other local users.
+  TUNNEL_TOKEN=$token nohup cloudflared tunnel run \
     >"$TUNNEL_LOG" 2>&1 </dev/null &
   tunnel_pid=$!
 }
@@ -503,8 +505,11 @@ case "$command" in
     command -v curl >/dev/null 2>&1 || die "curl is required to upgrade"
     ref=${1:-main}
     install_url=${NOOKWIRE_SSH_INSTALL_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/$ref/install.sh}
+    # Install the files from the same ref, not the installer's pinned default,
+    # so "upgrade main" actually installs main's launcher and companions.
+    base_url=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/$ref}
     printf 'Upgrading nookwire-ssh from %s\n' "$install_url"
-    curl -fsSL "$install_url" | sh
+    curl -fsSL "$install_url" | NOOKWIRE_SSH_BASE_URL="$base_url" sh
     ;;
   help|-h|--help)
     usage
