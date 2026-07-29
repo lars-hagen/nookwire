@@ -8,10 +8,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import asyncssh
 
-from nookwire_ssh import Config, create_acceptor, ensure_host_key
+from nookwire_ssh import (
+    Config,
+    create_acceptor,
+    ensure_host_key,
+    sanitize_locale_environment,
+)
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -483,6 +489,47 @@ class LauncherTests(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
             self.assertEqual(launcher.read_text(encoding="utf-8"), "old launcher")
             self.assertEqual(server.read_text(encoding="utf-8"), "old server")
+
+
+class LocaleSanitizerTests(unittest.TestCase):
+    UTF8_HOST = {"c": "C", "c.utf8": "C.utf8", "posix": "POSIX"}
+    ASCII_HOST = {"c": "C", "posix": "POSIX"}
+
+    def sanitize(self, environment, available):
+        with mock.patch(
+            "nookwire_ssh.available_locales", return_value=available
+        ):
+            sanitize_locale_environment(environment)
+        return environment
+
+    def test_missing_locale_falls_back_to_available_utf8(self):
+        environment = {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "PATH": "/bin"}
+        self.sanitize(environment, self.UTF8_HOST)
+        self.assertEqual(environment["LANG"], "C.utf8")
+        self.assertEqual(environment["LC_ALL"], "C.utf8")
+        self.assertEqual(environment["PATH"], "/bin")
+
+    def test_missing_locale_falls_back_to_c_without_utf8(self):
+        environment = {"LANG": "en_US.UTF-8"}
+        self.sanitize(environment, self.ASCII_HOST)
+        self.assertEqual(environment["LANG"], "C")
+
+    def test_available_locale_is_preserved(self):
+        environment = {"LANG": "C.UTF-8", "LC_ALL": "C"}
+        self.sanitize(environment, self.UTF8_HOST)
+        self.assertEqual(environment["LANG"], "C.UTF-8")
+        self.assertEqual(environment["LC_ALL"], "C")
+
+    def test_no_locale_variables_are_untouched(self):
+        environment = {"PATH": "/bin", "TERM": "xterm-256color"}
+        self.sanitize(environment, self.UTF8_HOST)
+        self.assertEqual(environment, {"PATH": "/bin", "TERM": "xterm-256color"})
+
+    def test_only_invalid_variables_are_replaced(self):
+        environment = {"LANG": "en_US.UTF-8", "LC_CTYPE": "C.utf8"}
+        self.sanitize(environment, self.UTF8_HOST)
+        self.assertEqual(environment["LANG"], "C.utf8")
+        self.assertEqual(environment["LC_CTYPE"], "C.utf8")
 
 
 if __name__ == "__main__":

@@ -123,16 +123,16 @@ The connecting machine uses `ssh -o ProxyCommand='cloudflared access ssh --hostn
 The `srvus` backend wraps non-HTTP traffic in TLS. `start` and `status` print the SSH form below with the real username and hostname filled in; the username is the host's OS account. Replace `USER` and `HOSTNAME.srv.us` manually for SFTP or SCP:
 
 ```sh
-ssh -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  USER@HOSTNAME.srv.us
+ssh USER@HOSTNAME.srv.us \
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
 
 sftp -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   USER@HOSTNAME.srv.us
 
 scp -O -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   notebook.py nookwire@HOSTNAME.srv.us:/notebook.py
 ```
 

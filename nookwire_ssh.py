@@ -15,6 +15,7 @@ import pty
 import signal
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
@@ -175,6 +176,84 @@ def build_child_argv(command: str, config: Config) -> list[str]:
     return [config.shell, "-i"]
 
 
+_LOCALE_ENV_VARS = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+    "LC_IDENTIFICATION",
+)
+
+
+def _normalize_locale(name: str) -> str:
+    return name.strip().casefold().replace("-", "")
+
+
+def available_locales() -> dict[str, str]:
+    """Map normalized locale names to their canonical form from ``locale -a``."""
+    try:
+        completed = subprocess.run(
+            ["locale", "-a"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        name = line.strip()
+        if name:
+            result.setdefault(_normalize_locale(name), name)
+    return result
+
+
+def sanitize_locale_environment(environment: dict[str, str]) -> None:
+    """Replace locale settings the host cannot provide so shells stop warning.
+
+    Container images often bake in LANG/LC_* values (e.g. en_US.UTF-8) without
+    generating the matching locale, so every child shell emits "setlocale:
+    cannot change locale" warnings. Fall back to an available UTF-8 locale, or C
+    as a last resort, whenever the requested one is missing.
+    """
+    requested = {
+        var: environment[var] for var in _LOCALE_ENV_VARS if environment.get(var)
+    }
+    if not requested:
+        return
+    available = available_locales()
+    if not available:
+        return
+
+    def is_usable(value: str) -> bool:
+        normalized = _normalize_locale(value)
+        return normalized in ("c", "posix") or normalized in available
+
+    if all(is_usable(value) for value in requested.values()):
+        return
+
+    replacement = None
+    for preferred in ("C.UTF-8", "C.utf8"):
+        replacement = available.get(_normalize_locale(preferred))
+        if replacement:
+            break
+    if replacement is None:
+        replacement = next(
+            (original for key, original in available.items() if key.endswith("utf8")),
+            "C",
+        )
+
+    for var, value in requested.items():
+        if not is_usable(value):
+            environment[var] = replacement
+
+
 def build_child_environment(
     process: asyncssh.SSHServerProcess, config: Config
 ) -> dict[str, str]:
@@ -191,6 +270,7 @@ def build_child_environment(
         # TERM set, so fall back to a widely supported value. PS1 and the rest of
         # the prompt are left to the login shell's own startup files.
         environment["TERM"] = process.term_type or "xterm-256color"
+    sanitize_locale_environment(environment)
     return environment
 
 

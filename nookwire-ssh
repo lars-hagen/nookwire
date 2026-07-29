@@ -190,12 +190,12 @@ render_srvus_connect() {
   if [ -n "$host" ]; then
     printf 'url: https://%s/\n' "$host"
     cat <<EOF
-ssh:
-ssh \\
+connect:
+ssh $ssh_user@$host \\
   -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
   -o StrictHostKeyChecking=no \\
   -o UserKnownHostsFile=/dev/null \\
-  $ssh_user@$host
+  -o LogLevel=ERROR
 EOF
   else
     printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
@@ -214,12 +214,12 @@ render_cloudflare_connect() {
   https=$(normalize_endpoint "$endpoint" https 2>/dev/null || printf '%s' "$endpoint")
   printf 'url: %s/tunnel/%s\n' "$https" "$session"
   cat <<EOF
-ssh:
-ssh \\
+connect:
+ssh $ssh_user@nookwire \\
   -o 'ProxyCommand=nookwire-ssh proxy $wss/tunnel/$session' \\
   -o StrictHostKeyChecking=no \\
   -o UserKnownHostsFile=/dev/null \\
-  $ssh_user@nookwire
+  -o LogLevel=ERROR
 EOF
   printf 'note: on the connecting machine, install nookwire-ssh (needs uv on PATH).\n'
 }
@@ -233,12 +233,12 @@ render_cloudflared_connect() {
   fi
   printf 'url: ssh://%s (via cloudflared)\n' "$hostname"
   cat <<EOF
-ssh:
-ssh \\
+connect:
+ssh $ssh_user@$hostname \\
   -o 'ProxyCommand=cloudflared access ssh --hostname %h' \\
   -o StrictHostKeyChecking=no \\
   -o UserKnownHostsFile=/dev/null \\
-  $ssh_user@$hostname
+  -o LogLevel=ERROR
 EOF
   printf 'note: the connecting machine needs cloudflared installed.\n'
 }
