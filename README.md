@@ -4,6 +4,8 @@ Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access
 
 The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. Every backend only carries bytes and never terminates SSH, so SSH's own encryption and authentication run between client and server. As with srv.us, the printed connect commands disable host-key persistence for these disposable environments, so trust in the ingress matches the existing model; do not treat any backend as protection against a hostile relay.
 
+Use Nookwire only on systems and workspaces you own or are explicitly authorized to administer. It provides authenticated access with the permissions of the host OS account and is not an OS-level sandbox. Public-key authentication is the recommended default. See [Security model](#security-model) and [SECURITY.md](SECURITY.md) before exposing a workspace.
+
 ## Prerequisites
 
 The remote machine needs Python 3 and uv. The default `srvus` backend also needs OpenSSH and `ssh-keygen`; the `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support; `cloudflare` needs OpenSSH, uv, and Nookwire SSH installed (its `proxy` subcommand is the ProxyCommand); `cloudflared` needs OpenSSH and `cloudflared`.
@@ -165,12 +167,13 @@ Options:
 
 ## Security model
 
-- Public-key authentication automatically uses `~/.ssh/authorized_keys`; password authentication remains available and uses constant-time comparison.
+- Public-key authentication is recommended and automatically uses `~/.ssh/authorized_keys`; password authentication remains available as a temporary fallback and uses constant-time comparison.
 - The generated password is removed from command environments.
 - SFTP and SCP are mapped into the configured root. Paths resolving through a symlink to somewhere outside that root are rejected, and creating symlinks over SFTP is disabled.
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
 - The server generates and reuses an Ed25519 host key in a private per-user temporary directory. The directory must be owned by the server user and not accessible by group or others; a forced setgid or sticky bit is tolerated. Existing keys must have the same owner and mode `0600`.
 - The connection examples disable host-key persistence because this targets short-lived disposable environments.
+- Nookwire should only be run on systems and workspaces the operator owns or is explicitly authorized to administer.
 
 ## Development
 
