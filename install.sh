@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=${NOOKWIRE_SSH_VERSION:-1.3.0}
+VERSION=${NOOKWIRE_SSH_VERSION:-1.3.1}
 BASE_URL=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/v$VERSION}
 PREFIX=${NOOKWIRE_SSH_PREFIX:-"$HOME/.local"}
 BIN_DIR="$PREFIX/bin"
