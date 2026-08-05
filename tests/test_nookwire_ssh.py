@@ -597,6 +597,66 @@ class LauncherTests(unittest.TestCase):
                     env=environment,
                 )
 
+    def test_srvus_key_permissions_are_fixed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "root"
+            root.mkdir()
+            bin_dir = temp_path / "bin"
+            bin_dir.mkdir()
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+
+            environment = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "HOME": str(temp_path / "home"),
+                "NOOKWIRE_SSH_STATE_DIR": str(temp_path / "state"),
+            }
+            home = Path(environment["HOME"])
+            home.mkdir()
+
+            fake_uv = bin_dir / "uv"
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                f'exec "{sys.executable}" -c \'import socket,time; '
+                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
+                "s.listen(); time.sleep(60)'\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            fake_keygen = bin_dir / "ssh-keygen"
+            fake_keygen.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_keygen.chmod(0o755)
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text(
+                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
+                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+
+            ssh_dir = home / ".ssh"
+            ssh_dir.mkdir()
+            ssh_dir.chmod(0o700)
+            key_file = ssh_dir / "id_ed25519"
+            key_file.write_text("tunnel key", encoding="utf-8")
+            key_file.chmod(0o660)
+
+            try:
+                started = subprocess.run(
+                    [str(LAUNCHER), "start", str(root), str(port), "1"],
+                    check=True, capture_output=True, text=True, env=environment,
+                )
+                self.assertIn("Fixed permissions", started.stderr)
+            finally:
+                subprocess.run(
+                    [str(LAUNCHER), "stop"], capture_output=True, text=True,
+                    env=environment,
+                )
+            self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+
     def test_curl_installer_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             prefix = Path(temp) / "prefix"
