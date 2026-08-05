@@ -8,6 +8,7 @@ TUNNEL_PID_FILE=$STATE_DIR/tunnel.pid
 SERVER_LOG=$STATE_DIR/server.log
 TUNNEL_LOG=$STATE_DIR/tunnel.log
 PASSWORD_FILE=$STATE_DIR/password
+SESSION_FILE=$STATE_DIR/session
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,7 @@ Usage: nookwire-ssh COMMAND [ARGS]
 
   start [DIR] [--port PORT] [--slot SLOT] [--backend srvus|cloudflare|cloudflared]
               [--endpoint URL] [--hostname HOST] [--token TOKEN]
+              [--accept] [--allow-tcp-forwarding]
   status
   logs [all|server|tunnel] [-f]
   stop
@@ -24,6 +26,11 @@ Usage: nookwire-ssh COMMAND [ARGS]
 start launches AsyncSSH plus a public tunnel in the background, exposing DIR
 (default: current directory) on PORT (default 8022). PORT and SLOT may also be
 given positionally, so "start", "start .", and "start /path 8022 1" all work.
+
+--accept admits any connecting client with no authentication (no key or
+password) and skips generating a password. --allow-tcp-forwarding lets a
+connected client reach other TCP services on this host via ssh -L through the
+session. Both can be combined with any backend.
 
 Backends select the ingress:
   srvus       (default) reverse tunnel over srv.us slot SLOT (default 1).
@@ -109,6 +116,17 @@ read_pid() {
   printf '%s\n' "$pid"
 }
 
+# Reuse a stable session (tunnel) id across restarts so the exposed endpoint
+# does not change on every start; the first start persists a generated id.
+get_or_create_session() {
+  if [ -f "$SESSION_FILE" ] && [ -s "$SESSION_FILE" ]; then
+    session=$(cat "$SESSION_FILE")
+    return 0
+  fi
+  session=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+  printf '%s\n' "$session" > "$SESSION_FILE"
+}
+
 process_identity() {
   python3 -c 'import hashlib,os,pathlib,subprocess,sys; p=sys.argv[1]; f=pathlib.Path("/proc")/p/"stat"; data=f.read_text().rsplit(")",1)[1].split()[19] if f.is_file() else subprocess.check_output(["ps","-p",p,"-o","lstart="], text=True).strip(); data or sys.exit(1); print(hashlib.sha256(data.encode()).hexdigest())' "$1" 2>/dev/null
 }
@@ -192,7 +210,7 @@ render_srvus_connect() {
     cat <<EOF
 connect:
 ssh $ssh_user@$host \\
-  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o 'ProxyCommand=openssl s_client -quiet -no_ign_eof -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
   -o StrictHostKeyChecking=no \\
   -o UserKnownHostsFile=/dev/null \\
   -o LogLevel=ERROR
@@ -259,11 +277,22 @@ show_status() {
     tunnel_ok=0
   fi
   ssh_user=$(id -un 2>/dev/null || echo nookwire)
-  [ ! -f "$PASSWORD_FILE" ] || printf 'username: %s\npassword: %s\n' "$ssh_user" "$(cat "$PASSWORD_FILE")"
-  if [ -s "$HOME/.ssh/authorized_keys" ]; then
-    printf 'key auth: enabled\n'
+  accept=$(meta_get accept)
+  allow_tcp_forwarding=$(meta_get allow_tcp_forwarding)
+  if [ "$accept" = 1 ]; then
+    printf 'auth: none (--accept); anyone can connect\n'
   else
-    printf 'key auth: disabled; add keys to ~/.ssh/authorized_keys\n'
+    [ ! -f "$PASSWORD_FILE" ] || printf 'username: %s\npassword: %s\n' "$ssh_user" "$(cat "$PASSWORD_FILE")"
+    if [ -s "$HOME/.ssh/authorized_keys" ]; then
+      printf 'key auth: enabled\n'
+    else
+      printf 'key auth: disabled; add keys to ~/.ssh/authorized_keys\n'
+    fi
+  fi
+  if [ "$allow_tcp_forwarding" = 1 ]; then
+    printf 'tcp forwarding: enabled; clients may use ssh -L through this session\n'
+  else
+    printf 'tcp forwarding: disabled; use --allow-tcp-forwarding\n'
   fi
   backend=$(meta_get backend)
   [ -n "$backend" ] || backend=srvus
@@ -339,6 +368,8 @@ write_meta() {
   {
     printf 'backend=%s\n' "$backend"
     printf 'port=%s\n' "$port"
+    printf 'accept=%s\n' "$accept"
+    printf 'allow_tcp_forwarding=%s\n' "$allow_tcp_forwarding"
     case "$backend" in
       cloudflare)
         printf 'endpoint=%s\n' "$endpoint"
@@ -366,6 +397,8 @@ case "$command" in
     token=
     session=
     ws_script=
+    accept=0
+    allow_tcp_forwarding=0
     posn=0
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -381,6 +414,8 @@ case "$command" in
         --hostname=*) hostname=${1#*=} ;;
         --token) shift; [ $# -ge 1 ] || die "--token needs a value"; token=$1 ;;
         --token=*) token=${1#*=} ;;
+        --accept) accept=1 ;;
+        --allow-tcp-forwarding) allow_tcp_forwarding=1 ;;
         -h|--help) usage; exit 0 ;;
         -*) die "Unknown option: $1 (see nookwire-ssh help)" ;;
         *)
@@ -411,16 +446,30 @@ case "$command" in
     ! is_running "$TUNNEL_PID_FILE" || die "Tunnel is already running"
     rm -f "$SERVER_PID_FILE" "$TUNNEL_PID_FILE"
     ! port_open "$port" || die "Port $port is already in use"
-    prompt_authorized_key
-    password=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
-    printf '%s' "$password" > "$PASSWORD_FILE"
-    session=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')
+    if [ "$accept" -eq 1 ]; then
+      rm -f "$PASSWORD_FILE"
+    else
+      prompt_authorized_key
+      password=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+      printf '%s' "$password" > "$PASSWORD_FILE"
+    fi
+    get_or_create_session
     : > "$SERVER_LOG"
     : > "$TUNNEL_LOG"
-    NOOKWIRE_SSH_PASSWORD=$password nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
-      python "$server_script" --root "$root" --host 127.0.0.1 --port "$port" \
-      --username "$(id -un)" \
-      >"$SERVER_LOG" 2>&1 </dev/null &
+    server_flags=""
+    [ "$accept" -eq 1 ] && server_flags="$server_flags --accept"
+    [ "$allow_tcp_forwarding" -eq 1 ] && server_flags="$server_flags --allow-tcp-forwarding"
+    if [ "$accept" -eq 1 ]; then
+      NOOKWIRE_SSH_PASSWORD= nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
+        python "$server_script" --root "$root" --host 127.0.0.1 --port "$port" \
+        --username "$(id -un)" $server_flags \
+        >"$SERVER_LOG" 2>&1 </dev/null &
+    else
+      NOOKWIRE_SSH_PASSWORD=$password nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
+        python "$server_script" --root "$root" --host 127.0.0.1 --port "$port" \
+        --username "$(id -un)" $server_flags \
+        >"$SERVER_LOG" 2>&1 </dev/null &
+    fi
     server_pid=$!
     write_pid "$server_pid" "$SERVER_PID_FILE" || {
       stop_untracked_pid "$server_pid"

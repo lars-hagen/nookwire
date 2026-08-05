@@ -43,10 +43,16 @@ class Config:
     authorized_keys: Path
     host_key: Path
     shell: str
+    accept: bool = False
+    allow_tcp_forwarding: bool = False
 
 
 class TokenSSHServer(asyncssh.SSHServer):
-    """Authenticate one disposable user with authorized keys or a password."""
+    """Authenticate one disposable user with authorized keys or a password.
+
+    When ``accept`` is set, no authentication is requested at all and any
+    connecting client is admitted, mirroring upterm's wide-open share mode.
+    """
 
     def __init__(self, config: Config):
         self.config = config
@@ -56,6 +62,10 @@ class TokenSSHServer(asyncssh.SSHServer):
         self.connection = connection
 
     def begin_auth(self, username: str) -> bool:
+        if self.config.accept:
+            # Return False to signal that no authentication is required, so
+            # the handshake succeeds immediately regardless of credentials.
+            return False
         valid_user = hmac.compare_digest(
             username.encode("utf-8"), self.config.username.encode("utf-8")
         )
@@ -67,10 +77,10 @@ class TokenSSHServer(asyncssh.SSHServer):
         return True
 
     def public_key_auth_supported(self) -> bool:
-        return self.config.authorized_keys.is_file()
+        return self.config.authorized_keys.is_file() and not self.config.accept
 
     def password_auth_supported(self) -> bool:
-        return True
+        return not self.config.accept
 
     def validate_password(self, username: str, password: str) -> bool:
         return hmac.compare_digest(
@@ -78,6 +88,22 @@ class TokenSSHServer(asyncssh.SSHServer):
         ) and hmac.compare_digest(
             password.encode("utf-8"), self.config.password.encode("utf-8")
         )
+
+    def connection_requested(
+        self,
+        dest_host: str,
+        dest_port: int,
+        orig_host: str,
+        orig_port: int,
+    ) -> bool:
+        """Allow SSH local TCP forwarding (ssh -L) when enabled.
+
+        Direct-TCP/IP channel opens reach destinations visible to the host.
+        Returning ``True`` makes AsyncSSH connect to ``dest_host:dest_port``
+        and splice the bytes, so a client can ``ssh -L`` through the session.
+        """
+        del dest_host, dest_port, orig_host, orig_port
+        return self.config.allow_tcp_forwarding
 
 
 def ensure_host_key(path: Path) -> None:
@@ -509,7 +535,10 @@ class ConfinedSFTPServer(asyncssh.SFTPServer):
         super().__init__(channel, chroot=self._root_path)
 
     def map_path(self, path: bytes) -> bytes:
-        mapped = super().map_path(path)
+        # Preserve SSH path semantics while retaining the configured root as
+        # the security boundary: absolute paths name host paths, and relative
+        # paths start at the exposed remote home.
+        mapped = os.path.normpath(path) if os.path.isabs(path) else super().map_path(path)
         resolved = os.path.realpath(mapped)
         self._require_confined(resolved)
         return resolved
@@ -524,7 +553,7 @@ class ConfinedSFTPServer(asyncssh.SFTPServer):
 
     def _map_entry(self, path: bytes) -> bytes:
         """Map a directory entry without following its final symlink."""
-        mapped = super().map_path(path)
+        mapped = os.path.normpath(path) if os.path.isabs(path) else super().map_path(path)
         self._require_confined(os.path.realpath(os.path.dirname(mapped)))
         return mapped
 
@@ -591,6 +620,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--authorized-keys", default="~/.ssh/authorized_keys", help="OpenSSH authorized_keys file")
     parser.add_argument("--host-key", default=str(DEFAULT_HOST_KEY), help="persistent Ed25519 host key path")
     parser.add_argument("--shell", default=None, help="shell used for commands and interactive sessions (default: $SHELL, then bash, then sh)")
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="skip all authentication and admit any connecting client",
+    )
+    parser.add_argument(
+        "--allow-tcp-forwarding",
+        action="store_true",
+        help="allow clients to use local TCP forwarding (ssh -L) through the session",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
 
@@ -622,7 +661,7 @@ def build_config(args: argparse.Namespace) -> Config:
         raise ValueError("Username must be non-empty and contain no whitespace")
 
     password = os.environ.get(args.password_env, "")
-    if len(password) < 16:
+    if not args.accept and len(password) < 16:
         raise ValueError(f"{args.password_env} must contain at least 16 characters")
 
     shell = resolve_shell(args.shell)
@@ -637,6 +676,8 @@ def build_config(args: argparse.Namespace) -> Config:
         authorized_keys=Path(args.authorized_keys).expanduser().resolve(),
         host_key=Path(args.host_key).expanduser().resolve(),
         shell=str(shell),
+        accept=args.accept,
+        allow_tcp_forwarding=args.allow_tcp_forwarding,
     )
 
 
@@ -653,6 +694,18 @@ async def serve(config: Config) -> None:
         f"as {config.username}; SFTP root and command cwd: {config.root}",
         flush=True,
     )
+    if config.accept:
+        print(
+            "nookwire-ssh: --accept set; anyone can connect without "
+            "authentication",
+            flush=True,
+        )
+    if config.allow_tcp_forwarding:
+        print(
+            "nookwire-ssh: --allow-tcp-forwarding set; clients may use "
+            "ssh -L through this session",
+            flush=True,
+        )
     try:
         await stop.wait()
     finally:

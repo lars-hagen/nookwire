@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import getpass
 import os
 import shutil
@@ -14,6 +15,7 @@ import asyncssh
 
 from nookwire_ssh import (
     Config,
+    TokenSSHServer,
     create_acceptor,
     ensure_host_key,
     sanitize_locale_environment,
@@ -49,14 +51,29 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         await self.acceptor.wait_closed()
         self.temporary.cleanup()
 
-    async def connect(self, password=None):
+    async def connect(self, password=None, port=None):
         return await asyncssh.connect(
             "127.0.0.1",
-            port=self.port,
+            port=port or self.port,
             username="nookwire",
             password=password or self.password,
             known_hosts=None,
         )
+
+    async def spawn(self, **overrides):
+        kwargs = dict(
+            root=self.root,
+            host="127.0.0.1",
+            port=0,
+            username="nookwire",
+            password=self.password,
+            password_env="NOOKWIRE_SSH_PASSWORD",
+            authorized_keys=Path(self.temporary.name) / "authorized_keys",
+            host_key=Path(self.temporary.name) / "host_key",
+            shell="/bin/sh",
+        )
+        kwargs.update(overrides)
+        return await create_acceptor(Config(**kwargs))
 
     async def test_password_auth_and_command_execution(self):
         async with await self.connect() as connection:
@@ -91,6 +108,86 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
                 client_keys=[key],
                 known_hosts=None,
             )
+
+    async def test_accept_skips_authentication(self):
+        acceptor = await self.spawn(
+            password="",
+            accept=True,
+            host_key=Path(self.temporary.name) / "host_key_accept",
+        )
+        try:
+            port = acceptor.get_port()
+            async with asyncssh.connect(
+                "127.0.0.1", port=port, username="whoever", known_hosts=None
+            ) as connection:
+                result = await connection.run("printf accept-me", check=True)
+            self.assertEqual(result.stdout, "accept-me")
+        finally:
+            acceptor.close()
+            await acceptor.wait_closed()
+
+    async def test_tcp_forwarding_respects_flag(self):
+        async def echo_handler(reader, writer):
+            try:
+                while data := await reader.read(1024):
+                    writer.write(data)
+                    await writer.drain()
+            except (ConnectionError, BrokenPipeError):
+                pass
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+        server = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
+        echo_port = server.sockets[0].getsockname()[1]
+
+        try:
+            acceptor = await self.spawn(
+                allow_tcp_forwarding=True,
+                host_key=Path(self.temporary.name) / "host_key_fwd",
+            )
+            try:
+                port = acceptor.get_port()
+                async with await self.connect(port=port) as connection:
+                    listener = await connection.forward_local_port(
+                        "127.0.0.1", 0, "127.0.0.1", echo_port
+                    )
+                    listen_port = listener.get_port()
+                    reader, writer = await asyncio.open_connection(
+                        "127.0.0.1", listen_port
+                    )
+                    writer.write(b"ping")
+                    await writer.drain()
+                    self.assertEqual(await reader.readexactly(4), b"ping")
+                    writer.close()
+                    await writer.wait_closed()
+                    listener.close()
+                    await listener.wait_closed()
+            finally:
+                acceptor.close()
+                await acceptor.wait_closed()
+
+            # A server without the flag must refuse direct TCP/IP forwards.
+            denied_base = Config(
+                root=self.root,
+                host="127.0.0.1",
+                port=0,
+                username="nookwire",
+                password=self.password,
+                password_env="NOOKWIRE_SSH_PASSWORD",
+                authorized_keys=Path(self.temporary.name) / "authorized_keys",
+                host_key=Path(self.temporary.name) / "host_key",
+                shell="/bin/sh",
+            )
+            allowed_base = Config(
+                **{**denied_base.__dict__, "allow_tcp_forwarding": True}
+            )
+            self.assertFalse(TokenSSHServer(denied_base).connection_requested("h", 1, "o", 2))
+            self.assertTrue(TokenSSHServer(allowed_base).connection_requested("h", 1, "o", 2))
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def test_pty_allocates_terminal(self):
         async with await self.connect() as connection:
@@ -132,24 +229,24 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         async with await self.connect() as connection:
             async with connection.start_sftp_client() as sftp:
                 self.assertEqual(await sftp.getcwd(), "/")
-                async with sftp.open("/source.txt", "rb") as source:
+                async with sftp.open(str(self.root / "source.txt"), "rb") as source:
                     self.assertEqual(await source.read(), b"hello")
-                await sftp.put(str(self.root / "source.txt"), "/nested.txt")
-                async with sftp.open("/nested.txt", "rb") as nested:
+                await sftp.put(str(self.root / "source.txt"), str(self.root / "nested.txt"))
+                async with sftp.open(str(self.root / "nested.txt"), "rb") as nested:
                     data = await nested.read()
                 with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.open("/outside-link/secret.txt", "rb")
-                attrs = await sftp.lstat("/outside-link")
+                    await sftp.open(str(self.root / "outside-link" / "secret.txt"), "rb")
+                attrs = await sftp.lstat(str(self.root / "outside-link"))
                 self.assertIsNotNone(attrs.permissions)
                 with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.readlink("/outside-link")
-                await sftp.rename("/outside-link", "/renamed-link")
+                    await sftp.readlink(str(self.root / "outside-link"))
+                await sftp.rename(str(self.root / "outside-link"), str(self.root / "renamed-link"))
                 with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.open("/renamed-link/secret.txt", "rb")
-                await sftp.remove("/renamed-link")
+                    await sftp.open(str(self.root / "renamed-link" / "secret.txt"), "rb")
+                await sftp.remove(str(self.root / "renamed-link"))
                 with self.assertRaises(asyncssh.SFTPError):
-                    await sftp.rmdir("/inside-link")
-                await sftp.remove("/inside-link")
+                    await sftp.rmdir(str(self.root / "inside-link"))
+                await sftp.remove(str(self.root / "inside-link"))
         self.assertEqual(data, b"hello")
         self.assertEqual((self.root / "nested.txt").read_text(encoding="utf-8"), "hello")
         self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "secret")
@@ -159,11 +256,16 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
     async def test_asyncssh_scp_round_trip(self):
         local = Path(self.temporary.name) / "local.txt"
         local.write_text("through scp", encoding="utf-8")
-        downloaded = Path(self.temporary.name) / "downloaded.txt"
+        absolute_download = Path(self.temporary.name) / "absolute-downloaded.txt"
+        relative_download = Path(self.temporary.name) / "relative-downloaded.txt"
         async with await self.connect() as connection:
-            await asyncssh.scp(local, (connection, "/remote.txt"))
-            await asyncssh.scp((connection, "/remote.txt"), downloaded)
-        self.assertEqual(downloaded.read_text(encoding="utf-8"), "through scp")
+            absolute_remote = str(self.root / "absolute.txt")
+            await asyncssh.scp(local, (connection, absolute_remote))
+            await asyncssh.scp((connection, absolute_remote), absolute_download)
+            await asyncssh.scp(local, (connection, "relative.txt"))
+            await asyncssh.scp((connection, "relative.txt"), relative_download)
+        self.assertEqual(absolute_download.read_text(encoding="utf-8"), "through scp")
+        self.assertEqual(relative_download.read_text(encoding="utf-8"), "through scp")
 
     async def test_disconnect_terminates_running_command(self):
         connection = await self.connect()
@@ -222,12 +324,20 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
             "-P", str(self.port),
         ]
         scp = await asyncio.create_subprocess_exec(
-            "scp", *scp_options, str(source), "nookwire@127.0.0.1:/system-scp.txt",
+            "scp", *scp_options, str(source),
+            f"nookwire@127.0.0.1:{self.root / 'system-absolute.txt'}",
             env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await scp.communicate()
         self.assertEqual(scp.returncode, 0, stderr.decode())
-        self.assertEqual((self.root / "system-scp.txt").read_text(encoding="utf-8"), "system scp")
+        relative_scp = await asyncio.create_subprocess_exec(
+            "scp", *scp_options, str(source), "nookwire@127.0.0.1:system-relative.txt",
+            env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await relative_scp.communicate()
+        self.assertEqual(relative_scp.returncode, 0, stderr.decode())
+        self.assertEqual((self.root / "system-absolute.txt").read_text(encoding="utf-8"), "system scp")
+        self.assertEqual((self.root / "system-relative.txt").read_text(encoding="utf-8"), "system scp")
 
 
 class LauncherTests(unittest.TestCase):
@@ -385,6 +495,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn("tunnel: running", status)
                 self.assertIn("url: https://example.srv.us/", status)
                 self.assertIn("ProxyCommand=openssl s_client", status)
+                self.assertIn("-quiet -no_ign_eof", status)
                 self.assertIn(f"{getpass.getuser()}@example.srv.us", status)
                 self.assertIn("key auth: disabled", status)
                 self.assertNotIn("logs:", started)
@@ -424,6 +535,67 @@ class LauncherTests(unittest.TestCase):
             finally:
                 unrelated.terminate()
                 unrelated.wait()
+
+    def test_accept_flag_skips_password(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "root"
+            root.mkdir()
+            bin_dir = temp_path / "bin"
+            bin_dir.mkdir()
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+
+            state_dir = temp_path / "state"
+            environment = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "HOME": str(temp_path / "home"),
+                "NOOKWIRE_SSH_STATE_DIR": str(state_dir),
+            }
+            Path(environment["HOME"]).mkdir()
+
+            fake_keygen = bin_dir / "ssh-keygen"
+            fake_keygen.write_text(
+                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
+                encoding="utf-8",
+            )
+            fake_keygen.chmod(0o755)
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text(
+                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
+                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            fake_uv = bin_dir / "uv"
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                f'exec "{sys.executable}" -c \'import socket,time; '
+                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
+                "s.listen(); time.sleep(60)'\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+
+            try:
+                started = subprocess.run(
+                    [str(LAUNCHER), "start", str(root), str(port), "1", "--accept"],
+                    check=True, capture_output=True, text=True, env=environment,
+                ).stdout
+                self.assertIn("started in the background", started)
+                self.assertFalse((state_dir / "password").exists())
+                status = subprocess.run(
+                    [str(LAUNCHER), "status"], check=True, capture_output=True,
+                    text=True, env=environment,
+                ).stdout
+                self.assertIn("auth: none (--accept)", status)
+            finally:
+                subprocess.run(
+                    [str(LAUNCHER), "stop"], capture_output=True, text=True,
+                    env=environment,
+                )
 
     def test_curl_installer_layout(self):
         with tempfile.TemporaryDirectory() as temp:

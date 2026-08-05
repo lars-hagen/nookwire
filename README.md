@@ -64,6 +64,28 @@ nookwire-ssh start /marimo 8022 1
 
 The command prints the generated password, srv.us URL, and a ready-to-run TLS-wrapped SSH command. It returns to the shell while both services keep running. `status` prints the same connection details later.
 
+### Wide-open share mode: `--accept`
+
+`--accept` skips authentication entirely: any connecting client is admitted without a key or password, no random password is generated or stored, and the `start`/`status` output replaces the credentials with an explicit warning. Combine it with the *tcp forwarding* flag below for an instant share:
+
+```sh
+nookwire-ssh start --accept
+```
+
+Only use `--accept` in scenarios where wide-open access is intended (for example a short-lived throwaway workspace). Do not expose it publicly on a system you do not own.
+
+### TCP forwarding: `--allow-tcp-forwarding`
+
+By default, a connected client cannot tunnel through the session. With `--allow-tcp-forwarding`, clients can use SSH local forwarding (`ssh -L`) to reach TCP destinations visible to the host, mirroring upterm's `--allow-local-tcp-forwarding`:
+
+```sh
+nookwire-ssh start --allow-tcp-forwarding
+# on the connecting machine:
+ssh -L 8080:db.internal:5432 USER@HOST ... # reaches db.internal:5432 from the host's network
+```
+
+The AsyncSSH server enables `direct-tcpip` channels only when this flag is set; otherwise such requests are refused.
+
 Inspect them later:
 
 ```sh
@@ -163,11 +185,19 @@ Options:
 --authorized-keys PATH
 --host-key PATH
 --shell PATH
+--accept
+--allow-tcp-forwarding
 ```
+
+`--accept` skips all authentication and admits any client, and skips generating a password. `--allow-tcp-forwarding` permits clients to use `ssh -L` local TCP forwarding through the session.
+
+The first `start` creates a stable session (tunnel) id under the state directory and reuses it on later starts, so the exposed endpoint does not change every restart.
 
 ## Security model
 
 - Public-key authentication is recommended and automatically uses `~/.ssh/authorized_keys`; password authentication remains available as a temporary fallback and uses constant-time comparison.
+- `--accept` disables both, admitting any client without credentials. It also skips password generation. Only use it where open access is intended.
+- TCP port forwarding is disabled by default; `--allow-tcp-forwarding` enables `ssh -L` through the session, which can reach any TCP service visible to the host's account.
 - The generated password is removed from command environments.
 - SFTP and SCP are mapped into the configured root. Paths resolving through a symlink to somewhere outside that root are rejected, and creating symlinks over SFTP is disabled.
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
