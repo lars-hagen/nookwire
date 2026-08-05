@@ -16,9 +16,21 @@ The remote machine needs Python 3 and uv. The default `srvus` backend also needs
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-Run it on the remote machine you want to expose. It installs the version-pinned `v1.4.1` files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+Run it on the remote machine you want to expose. It installs the version-pinned release files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
 
 Once installed, `nookwire-ssh upgrade` re-runs the installer in place (`nookwire-ssh upgrade REF` pins a branch or tag; default `main`). Restart a running server with `stop` then `start` to pick up the new code.
+
+### Releasing
+
+`pyproject.toml` is the single source of truth for the version. `scripts/bump_version.py` rewrites every embedded copy (launcher, installer, Python server) and regenerates the uv lockfile from it:
+
+```sh
+uv run scripts/bump_version.py 1.5.0
+git add -A && git commit -m "chore: bump version to 1.5.0"
+git tag v1.5.0 && git push origin main --tags
+```
+
+The tag matters: `install.sh` fetches the launcher and server from the `v$VERSION` tag.
 
 Any arguments after `--` are passed to `nookwire-ssh`, so a single command can install and start in one go. Exposing the current directory:
 
