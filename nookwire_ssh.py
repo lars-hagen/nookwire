@@ -25,7 +25,7 @@ from pathlib import Path
 import asyncssh
 
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 DEFAULT_PASSWORD_ENV = "NOOKWIRE_SSH_PASSWORD"
 DEFAULT_HOST_KEY = (
     Path(tempfile.gettempdir()) / f"nookwire-ssh-{os.geteuid()}" / "host-key"

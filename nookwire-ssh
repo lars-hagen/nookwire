@@ -2,7 +2,7 @@
 set -eu
 
 ASYNCSSH_VERSION=${NOOKWIRE_ASYNCSSH_VERSION:-2.24.0}
-VERSION="1.4.2"
+VERSION="1.4.3"
 STATE_DIR=${NOOKWIRE_SSH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/nookwire-ssh}
 SERVER_PID_FILE=$STATE_DIR/server.pid
 TUNNEL_PID_FILE=$STATE_DIR/tunnel.pid
@@ -572,10 +572,17 @@ case "$command" in
     # Install the files from the same ref, not the installer's pinned default,
     # so "upgrade main" actually installs main's launcher and companions.
     base_url=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/$ref}
-    target=$(curl -fsSL "$install_url" 2>/dev/null | sed -n 's/.*NOOKWIRE_SSH_VERSION:-\([0-9][0-9.]*\).*/\1/p')
+    # A proxy or HTTP cache on the connecting machine can serve a stale copy of
+    # main's installer, which then silently reinstalls the previous version.
+    # Bust it with a unique query string plus no-cache request headers.
+    case "$install_url" in
+      *\?*) fetch_url="$install_url&nc=$(date +%s)$$" ;;
+      *) fetch_url="$install_url?nc=$(date +%s)$$" ;;
+    esac
+    target=$(curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$fetch_url" 2>/dev/null | sed -n 's/.*NOOKWIRE_SSH_VERSION:-\([0-9][0-9.]*\).*/\1/p')
     [ -n "$target" ] || target="$ref"
     printf 'nookwire-ssh %s -> %s (from %s)\n' "$VERSION" "$target" "$install_url"
-    curl -fsSL "$install_url" | NOOKWIRE_SSH_BASE_URL="$base_url" sh
+    curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$fetch_url" | NOOKWIRE_SSH_BASE_URL="$base_url" sh
     ;;
   help|-h|--help)
     usage
