@@ -2,6 +2,7 @@
 set -eu
 
 ASYNCSSH_VERSION=${NOOKWIRE_ASYNCSSH_VERSION:-2.24.0}
+VERSION="1.4.1"
 STATE_DIR=${NOOKWIRE_SSH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/nookwire-ssh}
 SERVER_PID_FILE=$STATE_DIR/server.pid
 TUNNEL_PID_FILE=$STATE_DIR/tunnel.pid
@@ -22,6 +23,7 @@ Usage: nookwire-ssh COMMAND [ARGS]
   stop
   proxy WSS_URL
   upgrade [REF]
+  -v, --version  print the version and exit
 
 start launches AsyncSSH plus a public tunnel in the background, exposing DIR
 (default: current directory) on PORT (default 8022). PORT and SLOT may also be
@@ -557,11 +559,16 @@ case "$command" in
     # Install the files from the same ref, not the installer's pinned default,
     # so "upgrade main" actually installs main's launcher and companions.
     base_url=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/$ref}
-    printf 'Upgrading nookwire-ssh from %s\n' "$install_url"
+    target=$(curl -fsSL "$install_url" 2>/dev/null | sed -n 's/.*NOOKWIRE_SSH_VERSION:-\([0-9][0-9.]*\).*/\1/p')
+    [ -n "$target" ] || target="$ref"
+    printf 'nookwire-ssh %s -> %s (from %s)\n' "$VERSION" "$target" "$install_url"
     curl -fsSL "$install_url" | NOOKWIRE_SSH_BASE_URL="$base_url" sh
     ;;
   help|-h|--help)
     usage
+    ;;
+  -v|--version)
+    printf 'nookwire-ssh %s\n' "$VERSION"
     ;;
   *)
     usage >&2
