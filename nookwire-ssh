@@ -264,6 +264,7 @@ EOF
 }
 
 show_status() {
+  printf 'nookwire-ssh %s\n' "$VERSION"
   if is_running "$SERVER_PID_FILE"; then
     printf 'server: running (pid %s)\n' "$(read_pid "$SERVER_PID_FILE")"
     server_ok=1
