@@ -1,9 +1,22 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "nookwire-ssh"
-version = "1.6.0"
+dynamic = ["version"]
 description = "Temporary SSH, SFTP, and SCP access to ephemeral workspaces"
 requires-python = ">=3.10"
-dependencies = ["asyncssh==2.24.0"]
+dependencies = [
+    "asyncssh==2.24.0",
+    "websockets",
+]
 
-[tool.uv]
-package = false
+[project.scripts]
+nookwire-ssh = "nookwire_ssh.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nookwire_ssh.__version__"}

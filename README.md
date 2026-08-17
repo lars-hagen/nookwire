@@ -16,13 +16,13 @@ The remote machine needs Python 3 and uv, and nothing else for the default `srvu
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-Run it on the remote machine you want to expose. It installs the version-pinned release files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+Run it on the remote machine you want to expose. It installs `nookwire-ssh` as a [uv tool](https://docs.astral.sh/uv/reference/cli/#uv-tool) from the `v1.6.0` git tag, dropping the `nookwire-ssh` console script into `~/.local/bin`; add that directory to `PATH` if needed. The whole project, including the AsyncSSH server and the srv.us tunnel, is the `nookwire_ssh` Python package, so there are no companion scripts to keep in sync. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv. It refuses an unsafe destination (a symlink or directory where the console script belongs) and leaves any previous install in place when the new one fails.
 
-Once installed, `nookwire-ssh upgrade` re-runs the installer in place (`nookwire-ssh upgrade REF` pins a branch or tag; default `main`). Restart a running server with `stop` then `start` to pick up the new code.
+Once installed, `nookwire-ssh upgrade` re-runs the installer in place (`nookwire-ssh upgrade REF` pins a branch or tag; default `main`). Background processes are launched as `sys.executable -m nookwire_ssh.server` / `nookwire_ssh.tunnel`, so uv is never needed at runtime. Restart a running server with `stop` then `start` to pick up new code.
 
 ### Releasing
 
-`pyproject.toml` is the single source of truth for the version. `scripts/bump_version.py` rewrites every embedded copy (launcher, installer, Python server) and regenerates the uv lockfile from it:
+`pyproject.toml` is the single source of truth for the version; the CLI reads it via `importlib.metadata`. `scripts/bump_version.py` updates it and regenerates the uv lockfile:
 
 ```sh
 uv run scripts/bump_version.py 1.5.0
@@ -30,7 +30,7 @@ git add -A && git commit -m "chore: bump version to 1.5.0"
 git tag v1.5.0 && git push origin main --tags
 ```
 
-The tag matters: `install.sh` fetches the launcher and server from the `v$VERSION` tag.
+The tag matters: `install.sh` installs the package from the `v$VERSION` git tag.
 
 Any arguments after `--` are passed to `nookwire-ssh`, so a single command can install and start in one go. Exposing the current directory:
 
@@ -122,7 +122,7 @@ The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gi
 
 Reverse tunnel over srv.us. Zero account, zero domain; the connecting machine needs only OpenSSH and OpenSSL. See [Connect through TLS](#connect-through-tls).
 
-The tunnel runs `nookwire_tunnel.py`, which holds one AsyncSSH connection to srv.us with a remote forward back to the local server. It creates `~/.ssh/id_ed25519` on first use and reuses it, so the hostname stays stable, and it needs no OpenSSH on the remote machine.
+The tunnel runs the `nookwire_ssh.tunnel` module, which holds one AsyncSSH connection to srv.us with a remote forward back to the local server. It creates `~/.ssh/id_ed25519` on first use and reuses it, so the hostname stays stable, and it needs no OpenSSH on the remote machine.
 
 ```sh
 nookwire-ssh start --backend srvus --slot 1
@@ -143,7 +143,7 @@ nookwire-ssh start --backend cloudflare \
   --endpoint https://nookwire-ssh-relay.<subdomain>.workers.dev
 ```
 
-`status` prints an `ssh` command whose `ProxyCommand` is `nookwire-ssh proxy <wss-url>`. The connecting machine just installs Nookwire SSH the same way (the curl installer, which also drops `nookwire_ws.py` next to the launcher) and needs `uv` on `PATH`; no script paths to hand-edit. A per-start high-entropy tunnel id in the URL authorizes the session. Billing stays inside the free tier for interactive use: WebSocket messages bill at a 20:1 ratio and hibernation zeroes idle duration.
+`status` prints an `ssh` command whose `ProxyCommand` is `nookwire-ssh proxy <wss-url>`. The connecting machine just installs Nookwire SSH the same way (the curl installer) and needs `uv` on `PATH` for that one install; no script paths to hand-edit. A per-start high-entropy tunnel id in the URL authorizes the session. Billing stays inside the free tier for interactive use: WebSocket messages bill at a 20:1 ratio and hibernation zeroes idle duration.
 
 ### cloudflared (Cloudflare Tunnel)
 
@@ -204,9 +204,11 @@ The OpenSSL wrapper verifies both the srv.us certificate chain and hostname befo
 
 ## Run directly
 
+Inside a checkout, `uv sync` installs the package (deps included), then run the server module directly:
+
 ```sh
 export NOOKWIRE_SSH_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-uv run --with asyncssh==2.24.0 python nookwire_ssh.py \
+uv run python -m nookwire_ssh.server \
   --root /marimo \
   --host 127.0.0.1 \
   --port 8022
@@ -246,11 +248,13 @@ The first `start` creates a stable session (tunnel) id under the state directory
 
 ## Development
 
+The project is a `src/`-layout package under `src/nookwire_ssh/`: `cli.py` (subcommands), `server.py` (AsyncSSH server), `tunnel.py` (srv.us reverse tunnel), `relay.py` (WebSocket relay for the cloudflare backend), `state.py` (state dir, pid files, meta), and `sshconfig.py` (the srv.us config block).
+
 ```sh
+uv sync
 uv run python -W error::ResourceWarning -m unittest discover -s tests -v
-uv run python -m py_compile nookwire_ssh.py nookwire_tunnel.py tests/test_nookwire_ssh.py
-sh -n nookwire-ssh
+uv run python -m py_compile src/nookwire_ssh/*.py tests/*.py
 sh -n install.sh
 ```
 
-Tests cover password and public-key authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, background lifecycle and logs, system OpenSSH and SCP interoperability, the tunnel's key creation and remote forward, and the curl installer layout.
+Tests cover password and public-key authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, background lifecycle and logs, system OpenSSH and SCP interoperability, the tunnel's key creation and remote forward, and the install layout, failure handling, and unsafe-destination refusal.

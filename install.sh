@@ -1,33 +1,35 @@
 #!/bin/sh
 set -eu
 
+# Install Nookwire SSH as a uv tool. Everything after this one shell artifact is
+# Python in the src/nookwire_ssh package: there are no companion scripts to drop
+# beside a launcher anymore, so the whole install is a single `uv tool install`.
+#
+# Env overrides:
+#   NOOKWIRE_SSH_VERSION   pin a release tag (e.g. 1.6.0) instead of the default.
+#   NOOKWIRE_SSH_BASE_URL  override the source (repo URL/path) for the package.
+#   NOOKWIRE_SSH_PACKAGE   fully override the `uv tool install` package spec.
+#   NOOKWIRE_SSH_PREFIX    install the console script into $PREFIX/bin.
+#   UV_TOOL_DIR / UV_TOOL_BIN_DIR  standard uv tool isolation (honored).
+
 VERSION=${NOOKWIRE_SSH_VERSION:-1.6.0}
-BASE_URL=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/v$VERSION}
+PACKAGE=${NOOKWIRE_SSH_PACKAGE:-}
+if [ -z "$PACKAGE" ]; then
+  BASE=${NOOKWIRE_SSH_BASE_URL:-git+https://github.com/lars-hagen/nookwire-ssh}
+  REF=$VERSION
+  case "$VERSION" in
+    v*) ;;
+    *) REF="v$VERSION" ;;
+  esac
+  PACKAGE="$BASE@$REF"
+fi
 PREFIX=${NOOKWIRE_SSH_PREFIX:-"$HOME/.local"}
 BIN_DIR="$PREFIX/bin"
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nookwire-ssh-install.XXXXXX")
-HAD_LAUNCHER=0
-HAD_SERVER=0
-HAD_TUNNEL=0
-INSTALL_STARTED=0
-COMMITTED=0
-
-restore() {
-  if [ "$1" -eq 1 ]; then
-    mv "$TEMP_DIR/backup/$2" "$BIN_DIR/$2"
-  else
-    rm -f "$BIN_DIR/$2"
-  fi
-}
 
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
-  if [ "$INSTALL_STARTED" -eq 1 ] && [ "$COMMITTED" -ne 1 ]; then
-    restore "$HAD_LAUNCHER" nookwire-ssh
-    restore "$HAD_SERVER" nookwire_ssh.py
-    restore "$HAD_TUNNEL" nookwire_tunnel.py
-  fi
   rm -rf "$TEMP_DIR"
   exit "$status"
 }
@@ -72,49 +74,33 @@ if ! command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
-curl -fsSL "$BASE_URL/nookwire-ssh" -o "$TEMP_DIR/nookwire-ssh"
-curl -fsSL "$BASE_URL/nookwire_ssh.py" -o "$TEMP_DIR/nookwire_ssh.py"
-curl -fsSL "$BASE_URL/nookwire_tunnel.py" -o "$TEMP_DIR/nookwire_tunnel.py"
-
+# Reflect NOOKWIRE_SSH_PREFIX (and the temp tool dirs used by tests) into uv so
+# the console script lands where the caller asked.
+export UV_TOOL_BIN_DIR=${UV_TOOL_BIN_DIR:-"$BIN_DIR"}
+export UV_TOOL_DIR=${UV_TOOL_DIR:-"$PREFIX/share/uv/tools"}
 mkdir -p "$BIN_DIR"
-chmod 755 "$TEMP_DIR/nookwire-ssh"
-chmod 644 "$TEMP_DIR/nookwire_ssh.py"
-chmod 644 "$TEMP_DIR/nookwire_tunnel.py"
-mkdir "$TEMP_DIR/backup"
-for destination in "$BIN_DIR/nookwire-ssh" "$BIN_DIR/nookwire_ssh.py" "$BIN_DIR/nookwire_tunnel.py"; do
+
+# The destination of the console script must be writable and not a symlink or a
+# non-regular file: a stray directory or symlink would let the install clobber
+# something it does not own.
+for destination in "$UV_TOOL_BIN_DIR/nookwire-ssh"; do
   if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
     printf 'nookwire-ssh: refusing unsafe install destination: %s\n' "$destination" >&2
     exit 1
   fi
 done
-if [ -f "$BIN_DIR/nookwire-ssh" ]; then
-  cp -p "$BIN_DIR/nookwire-ssh" "$TEMP_DIR/backup/nookwire-ssh"
-  HAD_LAUNCHER=1
-fi
-if [ -f "$BIN_DIR/nookwire_ssh.py" ]; then
-  cp -p "$BIN_DIR/nookwire_ssh.py" "$TEMP_DIR/backup/nookwire_ssh.py"
-  HAD_SERVER=1
-fi
-if [ -f "$BIN_DIR/nookwire_tunnel.py" ]; then
-  cp -p "$BIN_DIR/nookwire_tunnel.py" "$TEMP_DIR/backup/nookwire_tunnel.py"
-  HAD_TUNNEL=1
-fi
-INSTALL_STARTED=1
-mv "$TEMP_DIR/nookwire-ssh" "$BIN_DIR/nookwire-ssh"
-mv "$TEMP_DIR/nookwire_ssh.py" "$BIN_DIR/nookwire_ssh.py"
-mv "$TEMP_DIR/nookwire_tunnel.py" "$BIN_DIR/nookwire_tunnel.py"
-COMMITTED=1
 
-# Best-effort companion for the cloudflare backend; the srvus and cloudflared
-# backends do not need it, so a missing file must not fail the install.
-if [ ! -L "$BIN_DIR/nookwire_ws.py" ]; then
-  if curl -fsSL "$BASE_URL/nookwire_ws.py" -o "$TEMP_DIR/nookwire_ws.py" 2>/dev/null; then
-    chmod 644 "$TEMP_DIR/nookwire_ws.py"
-    mv "$TEMP_DIR/nookwire_ws.py" "$BIN_DIR/nookwire_ws.py"
-  fi
+# uv owns the atomicity of the tool environment: it builds into its own staging
+# area and only swaps the console script in once the install succeeds, so a
+# failure leaves any previous installation in place. Copying the console script
+# aside here would not add a guarantee, since that script is only a shim into
+# the tool environment uv would have already replaced.
+if ! uv tool install --force "$PACKAGE"; then
+  printf 'nookwire-ssh: install failed; the previous installation was left in place\n' >&2
+  exit 1
 fi
 
-printf 'Installed nookwire-ssh to %s\n' "$BIN_DIR/nookwire-ssh"
+printf 'Installed nookwire-ssh to %s\n' "$UV_TOOL_BIN_DIR/nookwire-ssh"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf 'Add %s to PATH: export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
@@ -125,5 +111,5 @@ esac
 if [ "$#" -gt 0 ]; then
   rm -rf "$TEMP_DIR"
   trap - 0 HUP INT TERM
-  exec "$BIN_DIR/nookwire-ssh" "$@"
+  exec "$UV_TOOL_BIN_DIR/nookwire-ssh" "$@"
 fi

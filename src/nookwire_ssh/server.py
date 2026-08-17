@@ -25,7 +25,7 @@ from pathlib import Path
 import asyncssh
 
 
-VERSION = "1.6.0"
+from nookwire_ssh import __version__ as VERSION
 DEFAULT_PASSWORD_ENV = "NOOKWIRE_SSH_PASSWORD"
 DEFAULT_HOST_KEY = (
     Path(tempfile.gettempdir()) / f"nookwire-ssh-{os.geteuid()}" / "host-key"
@@ -721,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"nookwire-ssh: {error}", file=sys.stderr)
         return 1
     return 0
+
 
 
 if __name__ == "__main__":

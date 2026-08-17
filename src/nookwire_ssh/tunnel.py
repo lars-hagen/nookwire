@@ -7,7 +7,7 @@ SSH in-process here removes the OpenSSH client and ssh-keygen from the host's
 requirements; the tunnel then works on stripped images that ship neither.
 
 Launch with asyncssh available, e.g.:
-  uv run --with asyncssh==2.24.0 python nookwire_tunnel.py --local-port 8022 --slot 1
+  python -m nookwire_ssh.tunnel --local-port 8022 --slot 1
 """
 
 from __future__ import annotations
@@ -179,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, asyncssh.Error) as error:
         print(f"nookwire-tunnel: {error}", file=sys.stderr, flush=True)
         return 1
+
 
 
 if __name__ == "__main__":

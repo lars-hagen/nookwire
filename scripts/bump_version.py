@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Bump the nookwire-ssh version from a single source of truth.
+"""Bump the nookwire-ssh version.
 
-Usage: uv run scripts/bump_version.py 1.5.0
+Usage: uv run scripts/bump_version.py 1.7.0
 
-``pyproject.toml`` is authoritative. The launcher, installer, and Python server
-are standalone artifacts that cannot import it, so each embeds its own VERSION;
-this script rewrites all of them plus the uv lockfile so a release is one
-command from one place.
+``src/nookwire_ssh/__init__.py`` is the single source of truth: ``pyproject.toml``
+reads it as a dynamic attribute and the CLI reads it back through
+importlib.metadata. ``install.sh`` is the one artifact that cannot import it,
+because it runs before the package exists, so it carries the release tag as a
+literal and has to be rewritten here as well.
 """
 
 import argparse
@@ -17,63 +18,43 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def replace(path: Path, pattern: re.Pattern, replacement: str) -> bool:
+def replace(path: Path, pattern: re.Pattern, replacement: str) -> None:
     text = path.read_text()
     new, count = pattern.subn(replacement, text, count=1)
-    rel = path.relative_to(ROOT)
     if count != 1:
         raise SystemExit(
-            f"Expected exactly one match for {pattern.pattern!r} in {rel}, found {count}"
+            f"Expected exactly one match for {pattern.pattern!r} in "
+            f"{path.relative_to(ROOT)}, found {count}"
         )
-    if new != text:
-        path.write_text(new)
-        return True
-    return False
+    path.write_text(new)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Bump the nookwire-ssh version")
-    ap.add_argument("version", help="new version, e.g. 1.5.0")
+    ap.add_argument("version", help="new version, e.g. 1.7.0")
     args = ap.parse_args()
 
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
         ap.error(f"version must look like 1.2.3, got {args.version!r}")
-    version = args.version
 
     targets = [
         (
-            ROOT / "pyproject.toml",
-            re.compile(r'(^version = ")[^"]+(")', re.M),
-            f'\\g<1>{version}\\g<2>',
-        ),
-        (
-            ROOT / "nookwire_ssh.py",
-            re.compile(r'(^VERSION = ")[^"]+(")', re.M),
-            f'\\g<1>{version}\\g<2>',
+            ROOT / "src" / "nookwire_ssh" / "__init__.py",
+            re.compile(r'(^__version__ = ")[^"]+(")', re.M),
         ),
         (
             ROOT / "install.sh",
             re.compile(r"(NOOKWIRE_SSH_VERSION:-)[0-9.]+(\})"),
-            f"\\g<1>{version}\\g<2>",
-        ),
-        (
-            ROOT / "nookwire-ssh",
-            re.compile(r'(^VERSION=")[^"]+(")', re.M),
-            f'\\g<1>{version}\\g<2>',
         ),
     ]
-
-    updated = []
-    for rel, pattern, replacement in targets:
-        if replace(rel, pattern, replacement):
-            updated.append(rel.name)
+    for path, pattern in targets:
+        replace(path, pattern, rf"\g<1>{args.version}\g<2>")
 
     subprocess.run(["uv", "lock"], cwd=ROOT, check=True)
-    updated.append("uv.lock (regenerated)")
-
-    print("Updated:")
-    for name in updated:
-        print(f"  {name}")
+    print(f"Updated to {args.version}:")
+    for path, _ in targets:
+        print(f"  {path.relative_to(ROOT)}")
+    print("  uv.lock (regenerated)")
 
 
 if __name__ == "__main__":

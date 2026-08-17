@@ -11,8 +11,8 @@ Two modes pump a raw byte stream across a WebSocket relay (a Cloudflare Worker):
 The relay pairs one "origin" and one "client" socket per tunnel id. Roles are
 selected by appending role=origin|client to the base URL passed in.
 
-Launch with the websockets package available, e.g.:
-  uv run --with websockets python nookwire_ws.py client wss://host/tunnel/ID
+Launched by the CLI as ``python -m nookwire_ssh.relay`` for both the origin
+(remote) and client (ProxyCommand) roles; it needs the websockets package.
 """
 
 import argparse
@@ -20,18 +20,14 @@ import asyncio
 import os
 import sys
 
-try:
-    import websockets
-except ImportError:  # pragma: no cover - environment guard
-    sys.stderr.write("nookwire_ws: the 'websockets' package is required\n")
-    sys.exit(1)
+import websockets
 
 CHUNK = 65536
 CONNECT_KWARGS = dict(max_size=None, ping_interval=20, ping_timeout=20, close_timeout=5)
 
 
 def log(message):
-    sys.stderr.write("nookwire_ws: " + message + "\n")
+    sys.stderr.write("nookwire-ssh relay: " + message + "\n")
     sys.stderr.flush()
 
 
@@ -163,5 +159,6 @@ def main(argv=None):
     return 0
 
 
+
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
