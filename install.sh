@@ -8,23 +8,25 @@ BIN_DIR="$PREFIX/bin"
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nookwire-ssh-install.XXXXXX")
 HAD_LAUNCHER=0
 HAD_SERVER=0
+HAD_TUNNEL=0
 INSTALL_STARTED=0
 COMMITTED=0
+
+restore() {
+  if [ "$1" -eq 1 ]; then
+    mv "$TEMP_DIR/backup/$2" "$BIN_DIR/$2"
+  else
+    rm -f "$BIN_DIR/$2"
+  fi
+}
 
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
   if [ "$INSTALL_STARTED" -eq 1 ] && [ "$COMMITTED" -ne 1 ]; then
-    if [ "$HAD_LAUNCHER" -eq 1 ]; then
-      mv "$TEMP_DIR/backup/nookwire-ssh" "$BIN_DIR/nookwire-ssh"
-    else
-      rm -f "$BIN_DIR/nookwire-ssh"
-    fi
-    if [ "$HAD_SERVER" -eq 1 ]; then
-      mv "$TEMP_DIR/backup/nookwire_ssh.py" "$BIN_DIR/nookwire_ssh.py"
-    else
-      rm -f "$BIN_DIR/nookwire_ssh.py"
-    fi
+    restore "$HAD_LAUNCHER" nookwire-ssh
+    restore "$HAD_SERVER" nookwire_ssh.py
+    restore "$HAD_TUNNEL" nookwire_tunnel.py
   fi
   rm -rf "$TEMP_DIR"
   exit "$status"
@@ -72,12 +74,14 @@ fi
 
 curl -fsSL "$BASE_URL/nookwire-ssh" -o "$TEMP_DIR/nookwire-ssh"
 curl -fsSL "$BASE_URL/nookwire_ssh.py" -o "$TEMP_DIR/nookwire_ssh.py"
+curl -fsSL "$BASE_URL/nookwire_tunnel.py" -o "$TEMP_DIR/nookwire_tunnel.py"
 
 mkdir -p "$BIN_DIR"
 chmod 755 "$TEMP_DIR/nookwire-ssh"
 chmod 644 "$TEMP_DIR/nookwire_ssh.py"
+chmod 644 "$TEMP_DIR/nookwire_tunnel.py"
 mkdir "$TEMP_DIR/backup"
-for destination in "$BIN_DIR/nookwire-ssh" "$BIN_DIR/nookwire_ssh.py"; do
+for destination in "$BIN_DIR/nookwire-ssh" "$BIN_DIR/nookwire_ssh.py" "$BIN_DIR/nookwire_tunnel.py"; do
   if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
     printf 'nookwire-ssh: refusing unsafe install destination: %s\n' "$destination" >&2
     exit 1
@@ -91,9 +95,14 @@ if [ -f "$BIN_DIR/nookwire_ssh.py" ]; then
   cp -p "$BIN_DIR/nookwire_ssh.py" "$TEMP_DIR/backup/nookwire_ssh.py"
   HAD_SERVER=1
 fi
+if [ -f "$BIN_DIR/nookwire_tunnel.py" ]; then
+  cp -p "$BIN_DIR/nookwire_tunnel.py" "$TEMP_DIR/backup/nookwire_tunnel.py"
+  HAD_TUNNEL=1
+fi
 INSTALL_STARTED=1
 mv "$TEMP_DIR/nookwire-ssh" "$BIN_DIR/nookwire-ssh"
 mv "$TEMP_DIR/nookwire_ssh.py" "$BIN_DIR/nookwire_ssh.py"
+mv "$TEMP_DIR/nookwire_tunnel.py" "$BIN_DIR/nookwire_tunnel.py"
 COMMITTED=1
 
 # Best-effort companion for the cloudflare backend; the srvus and cloudflared

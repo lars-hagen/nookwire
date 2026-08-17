@@ -8,7 +8,7 @@ Use Nookwire only on systems and workspaces you own or are explicitly authorized
 
 ## Prerequisites
 
-The remote machine needs Python 3 and uv. The default `srvus` backend also needs OpenSSH and `ssh-keygen`; the `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support; `cloudflare` needs OpenSSH, uv, and Nookwire SSH installed (its `proxy` subcommand is the ProxyCommand); `cloudflared` needs OpenSSH and `cloudflared`.
+The remote machine needs Python 3 and uv, and nothing else for the default `srvus` backend: the tunnel speaks SSH through AsyncSSH, which the server already requires, so no OpenSSH client or `ssh-keygen` has to be installed. The `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support; `cloudflare` needs OpenSSH, uv, and Nookwire SSH installed (its `proxy` subcommand is the ProxyCommand); `cloudflared` needs OpenSSH and `cloudflared`.
 
 ## Install
 
@@ -122,6 +122,8 @@ The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gi
 
 Reverse tunnel over srv.us. Zero account, zero domain; the connecting machine needs only OpenSSH and OpenSSL. See [Connect through TLS](#connect-through-tls).
 
+The tunnel runs `nookwire_tunnel.py`, which holds one AsyncSSH connection to srv.us with a remote forward back to the local server. It creates `~/.ssh/id_ed25519` on first use and reuses it, so the hostname stays stable, and it needs no OpenSSH on the remote machine.
+
 ```sh
 nookwire-ssh start --backend srvus --slot 1
 ```
@@ -153,6 +155,30 @@ nookwire-ssh start --backend cloudflared \
 ```
 
 The connecting machine uses `ssh -o ProxyCommand='cloudflared access ssh --hostname %h'`, which `status` prints filled in.
+
+## Shorten the connect command
+
+The `ProxyCommand` never varies: every srv.us hostname takes the same block, so it belongs in `~/.ssh/config` on the connecting machine once instead of on every command line. After that, and for every future session, connecting is:
+
+```sh
+ssh USER@HOSTNAME.srv.us
+sftp USER@HOSTNAME.srv.us
+scp -O notebook.py USER@HOSTNAME.srv.us:/notebook.py
+```
+
+`nookwire-ssh ssh-config` prints the block and `nookwire-ssh ssh-config --write` appends it to `~/.ssh/config`, or paste it yourself:
+
+```
+Host *.srv.us
+  ProxyCommand openssl s_client -quiet -no_ign_eof -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+```
+
+`--write` appends, because prepending would pull any leading global keywords in an existing config under this `Host` block. SSH uses the first value it finds for each keyword, so it then asks `ssh -G` whether the block actually took effect and warns if an earlier `Host *` block overrides it; move the block above that one if so. Host-key checking is disabled for all `*.srv.us` names, not just the current session, matching what the printed command already does per invocation.
+
+`status` keeps printing the full self-contained command as well, for connecting from a machine you do not want to configure.
 
 ## Connect through TLS
 
@@ -215,15 +241,16 @@ The first `start` creates a stable session (tunnel) id under the state directory
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
 - The server generates and reuses an Ed25519 host key in a private per-user temporary directory. The directory must be owned by the server user and not accessible by group or others; a forced setgid or sticky bit is tolerated. Existing keys must have the same owner and mode `0600`.
 - The connection examples disable host-key persistence because this targets short-lived disposable environments.
+- The srvus tunnel does not verify the srv.us host key, matching the previous OpenSSH invocation. The ingress only carries bytes; SSH's own encryption and authentication still run end to end between client and server.
 - Nookwire should only be run on systems and workspaces the operator owns or is explicitly authorized to administer.
 
 ## Development
 
 ```sh
 uv run python -W error::ResourceWarning -m unittest discover -s tests -v
-uv run python -m py_compile nookwire_ssh.py tests/test_nookwire_ssh.py
+uv run python -m py_compile nookwire_ssh.py nookwire_tunnel.py tests/test_nookwire_ssh.py
 sh -n nookwire-ssh
 sh -n install.sh
 ```
 
-Tests cover password and public-key authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, background lifecycle and logs, system OpenSSH and SCP interoperability, and the curl installer layout.
+Tests cover password and public-key authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, background lifecycle and logs, system OpenSSH and SCP interoperability, the tunnel's key creation and remote forward, and the curl installer layout.

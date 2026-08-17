@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import getpass
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -24,6 +25,40 @@ from nookwire_ssh import (
 
 PROJECT = Path(__file__).resolve().parents[1]
 LAUNCHER = PROJECT / "nookwire-ssh"
+TUNNEL = PROJECT / "nookwire_tunnel.py"
+
+
+def fake_uv_script(port, python="python3", tunnel_prelude=""):
+    """Stand in for uv: hold the server port, or act as the srv.us tunnel.
+
+    The srvus backend runs the tunnel through uv as well, so the fake has to
+    tell the two invocations apart and emit a hostname for the tunnel one.
+    """
+    return (
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *nookwire_tunnel.py*)\n"
+        f"{tunnel_prelude}"
+        "    printf 'https://example.srv.us/\\n'\n"
+        f'    exec "{python}" -c "import time; time.sleep(60)"\n'
+        "    ;;\n"
+        "esac\n"
+        f"exec \"{python}\" -c 'import socket,time; "
+        f's=socket.socket(); s.bind(("127.0.0.1", {port})); '
+        "s.listen(); time.sleep(60)'\n"
+    )
+
+
+class ForwardingSSHServer(asyncssh.SSHServer):
+    """Minimal stand-in for srv.us: no auth, remote port forwarding allowed."""
+
+    def begin_auth(self, username):
+        del username
+        return False
+
+    def server_requested(self, listen_host, listen_port):
+        del listen_host, listen_port
+        return True
 
 
 class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
@@ -341,6 +376,71 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_tunnel_creates_key_and_forwards_to_local_port(self):
+        with tempfile.TemporaryDirectory() as temp:
+            asyncio.run(self.check_tunnel_forwarding(Path(temp)))
+
+    async def check_tunnel_forwarding(self, temporary):
+        async def echo(reader, writer):
+            writer.write(await reader.read(64))
+            await writer.drain()
+            writer.close()
+
+        local = await asyncio.start_server(echo, "127.0.0.1", 0)
+        local_port = local.sockets[0].getsockname()[1]
+
+        host_key = temporary / "relay_host_key"
+        host_key.write_bytes(
+            asyncssh.generate_private_key("ssh-ed25519").export_private_key()
+        )
+        relay = await asyncssh.create_server(
+            ForwardingSSHServer,
+            "127.0.0.1",
+            0,
+            server_host_keys=[str(host_key)],
+            process_factory=lambda process: process.exit(0),
+        )
+
+        # The key path does not exist yet: the tunnel has to create it, which is
+        # what replaces ssh-keygen for the srvus backend.
+        key_path = temporary / "tunnel-keys" / "id_ed25519"
+        tunnel = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(TUNNEL),
+            "--host", "127.0.0.1",
+            "--port", str(relay.get_port()),
+            "--local-port", str(local_port),
+            "--slot", "0",
+            "--key", str(key_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            slot = None
+            while slot is None:
+                line = await asyncio.wait_for(tunnel.stdout.readline(), 30)
+                if not line:
+                    self.fail("tunnel exited before the forward was ready")
+                match = re.search(rb"remote forward ready on slot (\d+)", line)
+                if match:
+                    slot = int(match.group(1))
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", slot)
+            writer.write(b"ping")
+            await writer.drain()
+            self.assertEqual(await asyncio.wait_for(reader.readexactly(4), 10), b"ping")
+            writer.close()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+        finally:
+            tunnel.terminate()
+            await tunnel.wait()
+            relay.close()
+            await relay.wait_closed()
+            local.close()
+            await local.wait_closed()
+
     def test_existing_host_key_requires_private_mode(self):
         with tempfile.TemporaryDirectory() as temp:
             key = Path(temp) / "host-key"
@@ -378,13 +478,7 @@ class LauncherTests(unittest.TestCase):
                 port = probe.getsockname()[1]
 
             fake_uv = bin_dir / "uv"
-            fake_uv.write_text(
-                "#!/bin/sh\n"
-                "exec python3 -c 'import socket,time; "
-                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
-                "s.listen(); time.sleep(60)'\n",
-                encoding="utf-8",
-            )
+            fake_uv.write_text(fake_uv_script(port), encoding="utf-8")
             fake_uv.chmod(0o755)
             fake_keygen = bin_dir / "ssh-keygen"
             fake_keygen.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -445,18 +539,15 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertIn("server: stopped", failed_status.stdout)
 
-            fake_ssh = bin_dir / "ssh"
-            fake_ssh.write_text(
-                "#!/bin/sh\nmkdir \"$NOOKWIRE_SSH_STATE_DIR/tunnel.pid\"\n"
-                f"printf '%s' \"$$\" > '{temp_path / 'tunnel-child'}'\n"
-                "printf 'https://example.srv.us/\\n'\n"
-                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
-
-            fake_keygen.write_text(
-                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
+            fake_uv.write_text(
+                fake_uv_script(
+                    port,
+                    python=sys.executable,
+                    tunnel_prelude=(
+                        '    mkdir "$NOOKWIRE_SSH_STATE_DIR/tunnel.pid"\n'
+                        f"    printf '%s' \"$$\" > '{temp_path / 'tunnel-child'}'\n"
+                    ),
+                ),
                 encoding="utf-8",
             )
             tunnel_pid_failure = subprocess.run(
@@ -476,10 +567,8 @@ class LauncherTests(unittest.TestCase):
                 os.kill(tunnel_pid, 0)
             (temp_path / "state with spaces" / "tunnel.pid").rmdir()
 
-            fake_ssh.write_text(
-                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
-                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
-                encoding="utf-8",
+            fake_uv.write_text(
+                fake_uv_script(port, python=sys.executable), encoding="utf-8"
             )
             try:
                 started = subprocess.run(
@@ -556,26 +645,9 @@ class LauncherTests(unittest.TestCase):
             }
             Path(environment["HOME"]).mkdir()
 
-            fake_keygen = bin_dir / "ssh-keygen"
-            fake_keygen.write_text(
-                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
-                encoding="utf-8",
-            )
-            fake_keygen.chmod(0o755)
-            fake_ssh = bin_dir / "ssh"
-            fake_ssh.write_text(
-                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
-                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
             fake_uv = bin_dir / "uv"
             fake_uv.write_text(
-                "#!/bin/sh\n"
-                f'exec "{sys.executable}" -c \'import socket,time; '
-                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
-                "s.listen(); time.sleep(60)'\n",
-                encoding="utf-8",
+                fake_uv_script(port, python=sys.executable), encoding="utf-8"
             )
             fake_uv.chmod(0o755)
 
@@ -619,23 +691,9 @@ class LauncherTests(unittest.TestCase):
 
             fake_uv = bin_dir / "uv"
             fake_uv.write_text(
-                "#!/bin/sh\n"
-                f'exec "{sys.executable}" -c \'import socket,time; '
-                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
-                "s.listen(); time.sleep(60)'\n",
-                encoding="utf-8",
+                fake_uv_script(port, python=sys.executable), encoding="utf-8"
             )
             fake_uv.chmod(0o755)
-            fake_keygen = bin_dir / "ssh-keygen"
-            fake_keygen.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-            fake_keygen.chmod(0o755)
-            fake_ssh = bin_dir / "ssh"
-            fake_ssh.write_text(
-                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
-                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
 
             ssh_dir = home / ".ssh"
             ssh_dir.mkdir()
@@ -656,6 +714,35 @@ class LauncherTests(unittest.TestCase):
                     env=environment,
                 )
             self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+
+    def test_ssh_config_prints_and_writes_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            environment = {**os.environ, "HOME": str(home)}
+
+            printed = subprocess.run(
+                [str(LAUNCHER), "ssh-config"], check=True, capture_output=True,
+                text=True, env=environment,
+            ).stdout
+            self.assertIn("Host *.srv.us", printed)
+            self.assertIn("openssl s_client", printed)
+            self.assertFalse((home / ".ssh" / "config").exists())
+
+            config = home / ".ssh" / "config"
+            config.parent.mkdir(mode=0o700)
+            config.write_text("Host build\n  User builder\n", encoding="utf-8")
+            for expected in ("Added the srv.us block", "Already present"):
+                written = subprocess.run(
+                    [str(LAUNCHER), "ssh-config", "--write"], check=True,
+                    capture_output=True, text=True, env=environment,
+                )
+                self.assertIn(expected, written.stdout)
+
+            contents = config.read_text(encoding="utf-8")
+            self.assertIn("Host build", contents)
+            self.assertEqual(contents.count("Host *.srv.us"), 1)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
 
     def test_curl_installer_layout(self):
         with tempfile.TemporaryDirectory() as temp:

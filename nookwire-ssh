@@ -22,6 +22,7 @@ Usage: nookwire-ssh COMMAND [ARGS]
   logs [all|server|tunnel] [-f]
   stop
   proxy WSS_URL
+  ssh-config [--write]
   upgrade [REF]
   -v, --version  print the version and exit
 
@@ -47,12 +48,30 @@ logs shows the last 100 log lines; add -f to follow.
 stop terminates both background processes.
 proxy bridges stdin/stdout to the cloudflare relay at WSS_URL; it is used as an
 ssh ProxyCommand on the connecting machine (status prints the exact command).
+ssh-config prints the ~/.ssh/config block that makes any USER@HOST.srv.us
+reachable with a plain ssh, so the printed ProxyCommand is needed only once;
+--write appends it to ~/.ssh/config on the connecting machine.
 upgrade re-runs the installer from REF (default main) to update in place; restart
 any running server with stop then start to pick up new code.
 EOF
 }
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+validate_public_key() {
+  if command -v ssh-keygen >/dev/null 2>&1; then
+    ssh-keygen -l -f "$1" >/dev/null 2>&1
+    return
+  fi
+  # No OpenSSH here; no backend needs it anymore. Check the wire format instead:
+  # "TYPE BASE64[ COMMENT]" whose base64 blob names that same type.
+  python3 -c 'import base64,struct,sys
+parts=open(sys.argv[1]).read().split()
+len(parts) >= 2 or sys.exit(1)
+blob=base64.b64decode(parts[1], validate=True)
+size,=struct.unpack(">I", blob[:4])
+blob[4:4 + size].decode() == parts[0] or sys.exit(1)' "$1" 2>/dev/null
+}
 
 validate_port() {
   python3 -c 'import re,sys; s=sys.argv[1]; valid=bool(re.fullmatch(r"[0-9]+", s)); valid or sys.exit(1); p=int(s); 1 <= p <= 65535 or sys.exit(1); print(p)' "$1"
@@ -99,7 +118,7 @@ prompt_authorized_key() {
     return 0
   }
   printf '%s\n' "$pasted" > "$tmp"
-  if ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+  if validate_public_key "$tmp"; then
     printf '%s\n' "$pasted" >> "$keys"
     chmod 600 "$keys"
     printf 'Key added to %s.\n' "$keys" >&2
@@ -204,13 +223,49 @@ value or sys.exit(1)
 print(scheme + "://" + value)' "$1" "$2"
 }
 
+print_ssh_config() {
+  cat <<'EOF'
+Host *.srv.us
+  ProxyCommand openssl s_client -quiet -no_ign_eof -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+EOF
+}
+
+write_ssh_config() {
+  config=$HOME/.ssh/config
+  if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
+    die "Unable to prepare $HOME/.ssh"
+  fi
+  if [ -f "$config" ] && grep -q '^Host \*\.srv\.us[[:space:]]*$' "$config"; then
+    printf 'Already present in %s\n' "$config"
+  else
+    # Appending never changes the meaning of existing lines, unlike prepending,
+    # which would pull any leading global keywords under this Host block.
+    { [ ! -s "$config" ] || printf '\n'; print_ssh_config; } >> "$config"
+    chmod 600 "$config"
+    printf 'Added the srv.us block to %s\n' "$config"
+  fi
+  # ssh takes the first value it finds for each keyword, so an earlier matching
+  # block wins. Ask ssh what it will actually do rather than assuming.
+  if command -v ssh >/dev/null 2>&1; then
+    case "$(ssh -G example.srv.us 2>/dev/null | sed -n 's/^proxycommand //p')" in
+      *s_client*) ;;
+      *) printf 'Warning: an earlier block in %s overrides it; move the srv.us block above any "Host *" block.\n' "$config" >&2 ;;
+    esac
+  fi
+}
+
 render_srvus_connect() {
   ssh_user=$1
   host=$(extract_host 2>/dev/null || true)
   if [ -n "$host" ]; then
     printf 'url: https://%s/\n' "$host"
+    printf 'connect: ssh %s@%s\n' "$ssh_user" "$host"
+    printf '  needs "nookwire-ssh ssh-config --write" once on the connecting machine\n'
     cat <<EOF
-connect:
+connect without that setup:
 ssh $ssh_user@$host \\
   -o 'ProxyCommand=openssl s_client -quiet -no_ign_eof -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
   -o StrictHostKeyChecking=no \\
@@ -308,24 +363,19 @@ show_status() {
 }
 
 launch_tunnel_srvus() {
-  command -v ssh >/dev/null 2>&1 || { stop_one "$SERVER_PID_FILE"; die "ssh is required for the srvus backend"; }
-  command -v ssh-keygen >/dev/null 2>&1 || { stop_one "$SERVER_PID_FILE"; die "ssh-keygen is required for the srvus backend"; }
+  tunnel_script=$here/nookwire_tunnel.py
+  [ -f "$tunnel_script" ] || { stop_one "$SERVER_PID_FILE"; die "Missing $tunnel_script; reinstall nookwire-ssh"; }
   if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
     stop_one "$SERVER_PID_FILE"
     die "Unable to prepare $HOME/.ssh"
   fi
-  if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
-    if ! ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"; then
-      stop_one "$SERVER_PID_FILE"
-      die "Unable to create the srv.us tunnel key"
-    fi
-  fi
-  # ssh refuses a private key that is readable by group or others. Correct the
-  # mode if it drifted (e.g. a permissive umask wrote a non-600 key).
+  # nookwire_tunnel.py creates the key on first use and reuses it afterwards, so
+  # srv.us keeps handing back the same hostname. The mode is still repaired here
+  # because OpenSSH shares this path and refuses a group- or world-readable key.
   key_mode=$(python3 -c 'import os,sys;print("%o"%(os.stat(sys.argv[1]).st_mode & 0o777))' "$HOME/.ssh/id_ed25519" 2>/dev/null || printf '')
   case "$key_mode" in
-    600) ;;
-    ?*)
+    600|'') ;;
+    *)
       if chmod 600 "$HOME/.ssh/id_ed25519" 2>/dev/null; then
         printf 'Fixed permissions on %s (was %s, now 600)\n' "$HOME/.ssh/id_ed25519" "$key_mode" >&2
       else
@@ -333,18 +383,24 @@ launch_tunnel_srvus() {
       fi
       ;;
   esac
-  nohup ssh \
-    -i "$HOME/.ssh/id_ed25519" \
-    -o IdentitiesOnly=yes \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=3 \
-    srv.us -R "$slot:127.0.0.1:$port" \
+  nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
+    python "$tunnel_script" \
+    --local-port "$port" --slot "$slot" --key "$HOME/.ssh/id_ed25519" \
     >"$TUNNEL_LOG" 2>&1 </dev/null &
   tunnel_pid=$!
+}
+
+# srv.us reports the hostname over the tunnel; wait for it so the status printed
+# by start carries the connect command instead of "pending".
+wait_for_srvus_host() {
+  count=0
+  while [ "$count" -lt 40 ]; do
+    is_running "$TUNNEL_PID_FILE" || return 0
+    [ -z "$(extract_host 2>/dev/null || true)" ] || return 0
+    sleep 0.5
+    count=$((count + 1))
+  done
+  return 0
 }
 
 launch_tunnel_cloudflare() {
@@ -523,6 +579,7 @@ case "$command" in
       tail -n 100 "$TUNNEL_LOG" >&2 || true
       exit 1
     fi
+    [ "$backend" != srvus ] || wait_for_srvus_host
     printf 'Nookwire SSH started in the background.\n'
     show_status || true
     ;;
@@ -556,6 +613,14 @@ case "$command" in
     stop_one "$SERVER_PID_FILE"
     rm -f "$STATE_DIR/meta"
     printf 'Nookwire SSH stopped.\n'
+    ;;
+  ssh-config)
+    [ $# -le 1 ] || die "Usage: nookwire-ssh ssh-config [--write]"
+    case "${1:-}" in
+      '') print_ssh_config ;;
+      --write) write_ssh_config ;;
+      *) die "Unknown option: $1 (only --write)" ;;
+    esac
     ;;
   proxy)
     [ $# -eq 1 ] || die "Usage: nookwire-ssh proxy WSS_URL"
