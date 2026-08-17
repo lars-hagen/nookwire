@@ -12,7 +12,7 @@ set -eu
 #   NOOKWIRE_SSH_PREFIX    install the console script into $PREFIX/bin.
 #   UV_TOOL_DIR / UV_TOOL_BIN_DIR  standard uv tool isolation (honored).
 
-VERSION=${NOOKWIRE_SSH_VERSION:-1.6.0}
+VERSION=${NOOKWIRE_SSH_VERSION:-2.0.0}
 PACKAGE=${NOOKWIRE_SSH_PACKAGE:-}
 if [ -z "$PACKAGE" ]; then
   BASE=${NOOKWIRE_SSH_BASE_URL:-git+https://github.com/lars-hagen/nookwire-ssh}

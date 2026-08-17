@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from nookwire_ssh import __version__
+
 PROJECT = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +46,7 @@ class InstallerTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(help_run.returncode, 0, help_run.stderr)
-            self.assertIn("1.6.0", help_run.stdout)
+            self.assertIn(__version__, help_run.stdout)
 
             config_run = subprocess.run(
                 [str(launcher), "ssh-config"],
