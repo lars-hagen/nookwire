@@ -493,14 +493,20 @@ class LauncherTests(unittest.TestCase):
 
             fake_python = bin_dir / "python3"
             fake_python.write_text(
-                "#!/bin/sh\ncase \"$2\" in *hashlib*) sleep 0.2 ;; esac\n"
+                "#!/bin/sh\n"
+                # process_identity runs inside write_pid, just before it writes
+                # the pid file, so claiming the path here makes that write fail
+                # with no timing assumption. The sleep only gives the launched
+                # fake time to record its own pid before it is killed.
+                'case "$2" in *hashlib*)\n'
+                '  mkdir -p "$NOOKWIRE_SSH_STATE_DIR/server.pid"; sleep 0.2 ;;\n'
+                "esac\n"
                 f'exec "{sys.executable}" "$@"\n',
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
             fake_uv.write_text(
                 "#!/bin/sh\n"
-                "mkdir \"$NOOKWIRE_SSH_STATE_DIR/server.pid\"\n"
                 f"printf '%s' \"$$\" > '{temp_path / 'server-child'}'\n"
                 f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
                 encoding="utf-8",
@@ -520,6 +526,10 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertIn("server: stopped", failed_status.stdout)
             (temp_path / "state with spaces" / "server.pid").rmdir()
+            fake_python.write_text(
+                "#!/bin/sh\n" f'exec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
 
             fake_uv.write_text(
                 "#!/bin/sh\n"
@@ -539,12 +549,19 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertIn("server: stopped", failed_status.stdout)
 
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                'case "$2" in *hashlib*)\n'
+                '  mkdir -p "$NOOKWIRE_SSH_STATE_DIR/tunnel.pid"; sleep 0.2 ;;\n'
+                "esac\n"
+                f'exec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
             fake_uv.write_text(
                 fake_uv_script(
                     port,
                     python=sys.executable,
                     tunnel_prelude=(
-                        '    mkdir "$NOOKWIRE_SSH_STATE_DIR/tunnel.pid"\n'
                         f"    printf '%s' \"$$\" > '{temp_path / 'tunnel-child'}'\n"
                     ),
                 ),
@@ -566,6 +583,10 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(tunnel_pid, 0)
             (temp_path / "state with spaces" / "tunnel.pid").rmdir()
+            fake_python.write_text(
+                "#!/bin/sh\n" f'exec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
 
             fake_uv.write_text(
                 fake_uv_script(port, python=sys.executable), encoding="utf-8"
