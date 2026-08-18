@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("restart", description="Stop, then start again with the saved settings.")
 
+    sub.add_parser("connect", description="Print the commands to run on the connecting machine.")
+
     proxy = sub.add_parser("proxy", description="Bridge stdin/stdout to the cloudflare relay.")
     proxy.add_argument("url")
 
@@ -488,7 +490,6 @@ def cmd_start(args) -> int:
         }
     )
 
-    print("Nookwire SSH started in the background.")
     _show_status()
     return 0
 
@@ -546,7 +547,7 @@ def _print_url_row(color: _Color, known: bool, url: str) -> None:
     if known:
         print(f"  url       {url}")
     else:
-        print("  url       pending   run: nookwire-ssh logs tunnel -f")
+        print("  url       pending   " + _Color(sys.stdout.isatty()).dim("(nookwire-ssh logs tunnel -f)"))
 
 
 def _print_auth_rows(color: _Color, state: Path) -> None:
@@ -562,11 +563,11 @@ def _print_auth_rows(color: _Color, state: Path) -> None:
         if keys.is_file() and keys.stat().st_size > 0:
             print("  keys      enabled")
         else:
-            print("  keys      disabled  " + color.dim("(add keys to ~/.ssh/authorized_keys)"))
+            print("  keys      disabled " + color.dim("(add keys to ~/.ssh/authorized_keys)"))
     if allow == "1":
         print("  forward   enabled")
     else:
-        print("  forward   disabled  " + color.dim("(--allow-tcp-forwarding)"))
+        print("  forward   disabled " + color.dim("(--allow-tcp-forwarding)"))
 
 
 def _setup_line(host: str, proxy_command: str) -> str:
@@ -597,91 +598,48 @@ def _fallback_line(ssh_user: str, host: str, proxy_command: str) -> str:
     )
 
 
-def _connect_section(
-    color: _Color,
-    ssh_user: str,
-    host: str,
-    proxy_command: str,
-    setup_host: str | None = None,
-    note: str | None = None,
-) -> None:
-    setup_host = setup_host or host
-    print("  connect   " + color.bold(f"ssh {ssh_user}@{host}"))
-    print()
-    print("  run once on the connecting machine:")
-    print("    " + color.dim(_setup_line(setup_host, proxy_command)))
-    print()
-    print("  or without that setup:")
-    print("    " + color.dim(_fallback_line(ssh_user, host, proxy_command)))
-    if note:
-        print()
-        print("  " + color.dim(note))
+class _Target:
+    """Everything needed to build a connect command, once a tunnel is up."""
+
+    def __init__(self, host: str, proxy_command: str, setup_host: str, url: str, note: str = ""):
+        self.host = host
+        self.proxy_command = proxy_command
+        self.setup_host = setup_host
+        self.url = url
+        self.note = note
 
 
-def render_srvus_connect(color: _Color, state: Path) -> None:
-    host = st.extract_host(state / "tunnel.log")
-    _print_url_row(color, bool(host), f"https://{host}/" if host else None)
-    _print_auth_rows(color, state)
-    if not host:
-        return
-    print()
-    _connect_section(
-        color,
-        _ssh_user(),
-        host,
-        sshconfig.SRVUS_PROXY_COMMAND,
-        setup_host="*.srv.us",
-    )
-
-
-def render_cloudflare_connect(color: _Color, state: Path) -> None:
-    del state
-    endpoint = st.meta_get("endpoint")
-    session = st.meta_get("session")
-    known = bool(endpoint and session)
-    url = None
-    proxy = None
-    if known:
+def connect_target(backend: str, state: Path) -> _Target | None:
+    """Resolve the published address, or None while the tunnel is still coming up."""
+    if backend == "cloudflare":
+        endpoint = st.meta_get("endpoint")
+        session = st.meta_get("session")
+        if not (endpoint and session):
+            return None
         https = normalize_endpoint(endpoint, "https") or endpoint
         wss = normalize_endpoint(endpoint, "wss") or endpoint
-        url = f"{https}/tunnel/{session}"
-        proxy = f"nookwire-ssh proxy {wss}/tunnel/{session}"
-    _print_url_row(color, known, url)
-    _print_auth_rows(color, st.state_dir())
-    if not known:
-        return
-    print()
-    _connect_section(
-        color,
-        _ssh_user(),
-        "nookwire",
-        proxy,
-        note="nookwire-ssh must be installed on the connecting machine.",
-    )
-
-
-def render_cloudflared_connect(color: _Color, state: Path) -> None:
-    del state
-    hostname = st.meta_get("hostname")
-    _print_url_row(color, bool(hostname), f"ssh://{hostname}" if hostname else None)
-    _print_auth_rows(color, st.state_dir())
-    if not hostname:
-        return
-    print()
-    _connect_section(
-        color,
-        _ssh_user(),
-        hostname,
-        "cloudflared access ssh --hostname %h",
-        note="cloudflared must be installed on the connecting machine.",
-    )
-
-
-BACKEND_RENDER = {
-    "cloudflare": render_cloudflare_connect,
-    "cloudflared": render_cloudflared_connect,
-    "srvus": render_srvus_connect,
-}
+        return _Target(
+            "nookwire",
+            f"nookwire-ssh proxy {wss}/tunnel/{session}",
+            "nookwire",
+            f"{https}/tunnel/{session}",
+            "nookwire-ssh must be installed on the connecting machine.",
+        )
+    if backend == "cloudflared":
+        hostname = st.meta_get("hostname")
+        if not hostname:
+            return None
+        return _Target(
+            hostname,
+            "cloudflared access ssh --hostname %h",
+            hostname,
+            f"ssh://{hostname}",
+            "cloudflared must be installed on the connecting machine.",
+        )
+    host = st.extract_host(state / "tunnel.log")
+    if not host:
+        return None
+    return _Target(host, sshconfig.SRVUS_PROXY_COMMAND, "*.srv.us", f"https://{host}/")
 
 
 def _show_status() -> int:
@@ -692,14 +650,49 @@ def _show_status() -> int:
     server_running = st.is_running(server_pid_file)
     tunnel_running = st.is_running(tunnel_pid_file)
     backend = st.meta_get("backend") or DEFAULT_BACKEND
+    target = connect_target(backend, state)
 
-    print(f"nookwire-ssh {_version()}  ·  {backend}")
+    print(f"nookwire-ssh {_version()} · {backend}")
     print()
     print(f"  server    {_proc_row(color, server_running, st.read_pid(server_pid_file))}")
     print(f"  tunnel    {_proc_row(color, tunnel_running, st.read_pid(tunnel_pid_file))}")
-
-    BACKEND_RENDER.get(backend, render_srvus_connect)(color, state)
+    _print_url_row(color, target is not None, target.url if target else "")
+    _print_auth_rows(color, state)
+    # The two pasteable commands are long enough to wrap badly, and they are
+    # needed once per connecting machine, not on every status. `connect` prints
+    # them; this stays scannable.
+    if target is not None:
+        print()
+        print("  connect   " + color.bold(f"ssh {_ssh_user()}@{target.host}"))
+        print("            " + color.dim("first time here: nookwire-ssh connect"))
     return 0 if (server_running and tunnel_running) else 1
+
+
+def cmd_connect(args) -> int:
+    del args
+    st.setup_state()
+    state = st.state_dir()
+    backend = st.meta_get("backend") or DEFAULT_BACKEND
+    target = connect_target(backend, state)
+    if target is None:
+        die("No published address yet; check nookwire-ssh status.")
+    color = _colorizer()
+    ssh_user = _ssh_user()
+    print("Run once on the machine you are connecting from:")
+    print()
+    print("  " + _setup_line(target.setup_host, target.proxy_command))
+    print()
+    print("Then, from now on:")
+    print()
+    print("  " + color.bold(f"ssh {ssh_user}@{target.host}"))
+    print()
+    print("Or, without changing any config:")
+    print()
+    print("  " + _fallback_line(ssh_user, target.host, target.proxy_command))
+    if target.note:
+        print()
+        print(color.dim(target.note))
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -841,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
         "logs": cmd_logs,
         "stop": cmd_stop,
         "restart": cmd_restart,
+        "connect": cmd_connect,
         "proxy": cmd_proxy,
         "ssh-config": cmd_ssh_config,
         "upgrade": cmd_upgrade,

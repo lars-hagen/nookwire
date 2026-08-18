@@ -102,9 +102,12 @@ Inspect them later:
 
 ```sh
 nookwire-ssh status
+nookwire-ssh connect
 nookwire-ssh logs
 nookwire-ssh logs tunnel -f
 ```
+
+`status` is a short summary. `connect` prints the commands to run on the machine you are connecting from.
 
 Stop everything:
 
@@ -194,7 +197,7 @@ nookwire-ssh ssh-config --write ssh.example.com
 
 `--write` appends, because prepending would pull any leading global keywords in an existing config under this `Host` block. SSH uses the first value it finds for each keyword, so it then asks `ssh -G` whether the block actually took effect and warns if an earlier `Host *` block overrides it; move the block above that one if so. Host-key checking is disabled for the affected names, matching what the printed command already does per invocation.
 
-`status` also prints a single self-contained one-line `ssh` command (a `ProxyCommand` inline, so no setup), plus a `grep ... || printf ...` one-liner that appends the config block to `~/.ssh/config` on the connecting machine in one paste.
+`nookwire-ssh connect` prints all of this ready to paste for whichever backend is running: the `grep ... || printf ...` one-liner that appends the block to `~/.ssh/config`, the short `ssh USER@HOST` that works afterwards, and a self-contained one-line `ssh` with the `ProxyCommand` inline for machines you would rather not configure. `status` stays short and points at it.
 
 ## Connect through TLS
 

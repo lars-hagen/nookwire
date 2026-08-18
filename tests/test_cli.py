@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import getpass
 import io
 import os
 import socket
@@ -151,7 +152,7 @@ class CLILifecycleTests(unittest.TestCase):
                     ["start", str(root), str(ssh_port), str(relay_forward)], env=env
                 )
                 self.assertEqual(code, 0, err)
-                self.assertIn("Nookwire SSH started in the background.", out)
+                self.assertIn("  server    running", out)
                 self.assertIn("Fixed permissions on", err)
                 self.assertIn("(was 660, now 600)", err)
                 self.assertEqual(key.stat().st_mode & 0o777, 0o600)
@@ -163,11 +164,16 @@ class CLILifecycleTests(unittest.TestCase):
                 self.assertIn("tunnel    running   pid", out)
                 self.assertIn(f"url       https://{SRVUS_HOST}/", out)
                 self.assertNotIn("\x1b[", out)
+                self.assertIn(f"connect   ssh {getpass.getuser()}@{SRVUS_HOST}", out)
+                self.assertIn("keys      disabled", out)
+                self.assertNotIn("logs tunnel -f", out)
+
+                code, out, err = run_cli(["connect"], env=env)
+                self.assertEqual(code, 0, err)
                 self.assertIn("openssl s_client", out)
                 self.assertIn("-quiet", out)
                 self.assertIn("-no_ign_eof", out)
-                self.assertIn("keys      disabled", out)
-                self.assertNotIn("logs tunnel -f", out)
+                self.assertIn("Host *.srv.us", out)
 
                 code, out, err = run_cli(["logs", "tunnel"], env=env)
                 self.assertEqual(code, 0)
@@ -378,7 +384,11 @@ class CLILifecycleTests(unittest.TestCase):
             code, out, err = run_cli(["status"], env=env)
             self.assertNotIn("\x1b[", out)
             self.assertIn("url       ssh://glacier.vctx.io", out)
+            self.assertIn("first time here: nookwire-ssh connect", out)
+            code, out, err = run_cli(["connect"], env=env)
+            self.assertEqual(code, 0, err)
             self.assertIn("cloudflared must be installed", out)
+            self.assertNotIn("\x1b[", out)
 
 
 class SSHConfigTests(unittest.TestCase):
