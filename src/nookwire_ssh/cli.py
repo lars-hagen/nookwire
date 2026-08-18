@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("positional", nargs="*", help="DIR [PORT] [SLOT]")
     start.add_argument("--port", "-p")
     start.add_argument("--slot", "-s")
-    start.add_argument("--backend", default=DEFAULT_BACKEND)
+    start.add_argument("--backend", default=None)
     start.add_argument("--endpoint")
     start.add_argument("--hostname")
     start.add_argument("--token")
@@ -70,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-f", action="store_true")
 
     sub.add_parser("stop", description="Terminate both background processes.")
+
+    sub.add_parser("restart", description="Stop, then start again with the saved settings.")
 
     proxy = sub.add_parser("proxy", description="Bridge stdin/stdout to the cloudflare relay.")
     proxy.add_argument("url")
@@ -91,13 +93,14 @@ def die(message: str) -> None:
     raise SystemExit(message)
 
 
-def _resolve_positional(start) -> tuple[Path, int, int]:
+def _resolve_positional(start, saved: dict[str, str] | None = None) -> tuple[Path, int, int]:
+    saved = saved or {}
     args = start.positional
     if len(args) > 3:
         die(f"Too many arguments: {' '.join(args[3:])}")
-    root_arg = args[0] if len(args) >= 1 else "."
-    port_arg = args[1] if len(args) >= 2 else (start.port or DEFAULT_PORT)
-    slot_arg = args[2] if len(args) >= 3 else (start.slot or DEFAULT_SLOT)
+    root_arg = args[0] if len(args) >= 1 else (saved.get("root") or ".")
+    port_arg = args[1] if len(args) >= 2 else (start.port or saved.get("port") or DEFAULT_PORT)
+    slot_arg = args[2] if len(args) >= 3 else (start.slot or saved.get("slot") or DEFAULT_SLOT)
 
     port_text = str(port_arg)
     if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
@@ -376,9 +379,22 @@ def wait_for_srvus_host(tunnel_pid_file: Path, tunnel_log: Path) -> None:
 
 
 def cmd_start(args) -> int:
+    # Anything not given explicitly falls back to the last successful start, so
+    # a repeat run on the same box needs no arguments. --accept and
+    # --allow-tcp-forwarding are deliberately never restored: silently
+    # reinstating a no-auth session would be a nasty surprise.
+    saved = st.read_config()
+    if args.backend is None:
+        args.backend = saved.get("backend") or DEFAULT_BACKEND
     if args.backend not in ("srvus", "cloudflare", "cloudflared"):
         die(f"Unknown backend: {args.backend} (use srvus, cloudflare, or cloudflared)")
-    root, port, slot = _resolve_positional(args)
+    if not args.hostname:
+        args.hostname = saved.get("hostname") or ""
+    if not args.endpoint:
+        args.endpoint = saved.get("endpoint") or ""
+    if not args.token:
+        args.token = os.environ.get("NOOKWIRE_CLOUDFLARED_TOKEN") or saved.get("token") or ""
+    root, port, slot = _resolve_positional(args, saved)
     state = st.setup_state()
     server_pid_file = state / "server.pid"
     tunnel_pid_file = state / "tunnel.pid"
@@ -457,6 +473,17 @@ def cmd_start(args) -> int:
     if args.backend == "cloudflared":
         meta["hostname"] = args.hostname or ""
     st.write_meta(meta)
+    st.write_config(
+        {
+            "backend": args.backend,
+            "root": str(root),
+            "port": str(port),
+            "slot": str(slot),
+            "hostname": args.hostname or "",
+            "endpoint": args.endpoint or "",
+            "token": args.token or "",
+        }
+    )
 
     print("Nookwire SSH started in the background.")
     _show_status()
@@ -730,6 +757,26 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def cmd_restart(args) -> int:
+    st.setup_state()
+    if not st.read_config():
+        die("Nothing saved to restart; run start with its options once first.")
+    cmd_stop(args)
+    return cmd_start(
+        argparse.Namespace(
+            positional=[],
+            port=None,
+            slot=None,
+            backend=None,
+            endpoint=None,
+            hostname=None,
+            token=None,
+            accept=False,
+            allow_tcp_forwarding=False,
+        )
+    )
+
+
 def install_spec(ref: str) -> str:
     """Return the package spec for ``uv tool install``.
 
@@ -790,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "logs": cmd_logs,
         "stop": cmd_stop,
+        "restart": cmd_restart,
         "proxy": cmd_proxy,
         "ssh-config": cmd_ssh_config,
         "upgrade": cmd_upgrade,

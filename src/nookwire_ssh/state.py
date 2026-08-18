@@ -190,6 +190,32 @@ def write_meta(entries: dict[str, str]) -> None:
     (state_dir() / "meta").write_text(content)
 
 
+def read_config() -> dict[str, str]:
+    """Return the settings saved by the last successful start.
+
+    Unlike ``meta``, this survives ``stop`` so a later bare ``start`` can reuse
+    the backend, hostname and token without retyping them.
+    """
+    settings: dict[str, str] = {}
+    try:
+        for line in (state_dir() / "config").read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator and value:
+                settings[key] = value
+    except OSError:
+        pass
+    return settings
+
+
+def write_config(entries: dict[str, str]) -> None:
+    """Persist start settings owner-readable only; this file holds the token."""
+    config = state_dir() / "config"
+    content = "".join(f"{key}={value}\n" for key, value in entries.items() if value)
+    config.write_text(content)
+    with contextlib.suppress(OSError):
+        config.chmod(0o600)
+
+
 def repair_key_permissions(key: Path) -> None:
     """chmod an srv.us tunnel key to 0600, mirroring OpenSSH's restriction.
 

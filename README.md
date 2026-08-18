@@ -112,6 +112,15 @@ Stop everything:
 nookwire-ssh stop
 ```
 
+Start it again without retyping anything:
+
+```sh
+nookwire-ssh restart
+nookwire-ssh start
+```
+
+A successful start saves its backend, root, port, slot, hostname, endpoint, and tunnel token to `config` in the state directory, owner-readable only. Any of those left off a later `start` falls back to the saved value, so a second run on the same machine needs no arguments. `--accept` and `--allow-tcp-forwarding` are never restored; a session that disabled authentication has to say so again every time.
+
 The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gives srv.us a stable hostname. Runtime state, credentials, PID files, and logs are stored under `~/.local/state/nookwire-ssh` by default.
 
 ## Backends

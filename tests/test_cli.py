@@ -323,6 +323,46 @@ class CLILifecycleTests(unittest.TestCase):
             self.assertFalse((state / "server.pid").exists())
             self.assertFalse((state / "tunnel.pid").exists())
 
+    def test_saved_settings_are_reused_by_a_bare_start(self):
+        """A repeat start on the same box needs no arguments."""
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            state.mkdir(parents=True)
+            root = temp / "root"
+            root.mkdir()
+            env = make_env(home, state_base)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                sock.listen(1)
+                port = sock.getsockname()[1]
+                (state / "config").write_text(
+                    "backend=cloudflared\n"
+                    f"root={root}\n"
+                    f"port={port}\n"
+                    "slot=1\n"
+                    "hostname=glacier.vctx.io\n"
+                    "token=saved-token-value\n"
+                )
+                # No arguments at all: the saved port has to be the one it tries.
+                code, out, err = run_cli(["start"], env=env)
+            self.assertNotEqual(code, 0, err)
+            self.assertIn(f"Port {port} is already in use", err)
+
+    def test_restart_without_saved_settings_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            env = make_env(home, state_base)
+            code, out, err = run_cli(["restart"], env=env)
+            self.assertNotEqual(code, 0)
+            self.assertIn("Nothing saved to restart", err)
+
     def test_status_non_tty_has_no_ansi(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
