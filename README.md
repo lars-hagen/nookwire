@@ -166,7 +166,7 @@ sftp USER@HOSTNAME.srv.us
 scp -O notebook.py USER@HOSTNAME.srv.us:/notebook.py
 ```
 
-`nookwire-ssh ssh-config` prints the block and `nookwire-ssh ssh-config --write` appends it to `~/.ssh/config`, or paste it yourself:
+`nookwire-ssh ssh-config` prints the default `Host *.srv.us` block and `nookwire-ssh ssh-config --write` appends it to `~/.ssh/config`, or paste it yourself:
 
 ```
 Host *.srv.us
@@ -176,9 +176,16 @@ Host *.srv.us
   LogLevel ERROR
 ```
 
-`--write` appends, because prepending would pull any leading global keywords in an existing config under this `Host` block. SSH uses the first value it finds for each keyword, so it then asks `ssh -G` whether the block actually took effect and warns if an earlier `Host *` block overrides it; move the block above that one if so. Host-key checking is disabled for all `*.srv.us` names, not just the current session, matching what the printed command already does per invocation.
+Pass a HOST to emit a block scoped to that host instead, using the ProxyCommand for the currently configured backend (read from state): srv.us keeps the OpenSSL wrapper, cloudflared uses `cloudflared access ssh --hostname %h`, and the cloudflare worker relay uses `nookwire-ssh proxy <wss url>`:
 
-`status` keeps printing the full self-contained command as well, for connecting from a machine you do not want to configure.
+```sh
+nookwire-ssh ssh-config ssh.example.com
+nookwire-ssh ssh-config --write ssh.example.com
+```
+
+`--write` appends, because prepending would pull any leading global keywords in an existing config under this `Host` block. SSH uses the first value it finds for each keyword, so it then asks `ssh -G` whether the block actually took effect and warns if an earlier `Host *` block overrides it; move the block above that one if so. Host-key checking is disabled for the affected names, matching what the printed command already does per invocation.
+
+`status` also prints a single self-contained one-line `ssh` command (a `ProxyCommand` inline, so no setup), plus a `grep ... || printf ...` one-liner that appends the config block to `~/.ssh/config` on the connecting machine in one paste.
 
 ## Connect through TLS
 

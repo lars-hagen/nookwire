@@ -97,8 +97,6 @@ def write_pid(pid_file: Path, pid: int) -> bool:
     identity = process_identity(pid)
     if identity is None:
         return False
-    import os as _os
-    print(f"DEBUGWRITE {pid_file} is_dir={_os.path.isdir(pid_file)} -> before", flush=True)
     try:
         pid_file.write_text(f"{pid} {identity}\n")
     except OSError:

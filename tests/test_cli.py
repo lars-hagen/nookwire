@@ -85,7 +85,18 @@ def run_cli(argv, env=None):
         os.environ.update(env)
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = cli.main(argv)
+            try:
+                code = cli.main(argv)
+            except SystemExit as exc:
+                # die() raises SystemExit(message); the interpreter prints a
+                # string code to stderr before exiting 1, so simulate that.
+                if isinstance(exc.code, str):
+                    stderr.write(exc.code + "\n")
+                    code = 1
+                elif exc.code is None:
+                    code = 0
+                else:
+                    code = exc.code
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -148,13 +159,14 @@ class CLILifecycleTests(unittest.TestCase):
 
                 code, out, err = run_cli(["status"], env=env)
                 self.assertEqual(code, 0)
-                self.assertIn("server: running (pid", out)
-                self.assertIn("tunnel: running (pid", out)
-                self.assertIn(f"url: https://{SRVUS_HOST}/", out)
+                self.assertIn("server    running   pid", out)
+                self.assertIn("tunnel    running   pid", out)
+                self.assertIn(f"url       https://{SRVUS_HOST}/", out)
+                self.assertNotIn("\x1b[", out)
                 self.assertIn("openssl s_client", out)
                 self.assertIn("-quiet", out)
                 self.assertIn("-no_ign_eof", out)
-                self.assertIn("key auth: disabled", out)
+                self.assertIn("keys      disabled", out)
                 self.assertNotIn("logs tunnel -f", out)
 
                 code, out, err = run_cli(["logs", "tunnel"], env=env)
@@ -173,8 +185,8 @@ class CLILifecycleTests(unittest.TestCase):
 
             code, out, err = run_cli(["status"], env=env)
             self.assertEqual(code, 1)
-            self.assertIn("server: stopped", out)
-            self.assertIn("tunnel: stopped", out)
+            self.assertIn("server    stopped", out)
+            self.assertIn("tunnel    stopped", out)
 
     def test_stop_refuses_mismatched_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -287,7 +299,46 @@ class CLILifecycleTests(unittest.TestCase):
 
             (state / "meta").write_text("accept=1\nallow_tcp_forwarding=0\nbackend=srvus\n")
             code, out, err = run_cli(["status"], env=env)
-            self.assertIn("auth: none (--accept); anyone can connect", out)
+            self.assertIn("auth      none (--accept); anyone can connect", out)
+
+    def test_start_refuses_occupied_port(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            root = temp / "root"
+            root.mkdir()
+            env = make_env(home, state_base)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                sock.listen(1)
+                port = sock.getsockname()[1]
+                code, out, err = run_cli(
+                    ["start", str(root), str(port), "1", "--accept"], env=env
+                )
+            self.assertNotEqual(code, 0, err)
+            self.assertIn(f"Port {port} is already in use", err)
+            self.assertFalse((state / "server.pid").exists())
+            self.assertFalse((state / "tunnel.pid").exists())
+
+    def test_status_non_tty_has_no_ansi(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            state.mkdir(parents=True)
+            (state / "meta").write_text(
+                "accept=0\nallow_tcp_forwarding=0\nbackend=cloudflared\nhostname=glacier.vctx.io\n"
+            )
+            env = make_env(home, state_base)
+            code, out, err = run_cli(["status"], env=env)
+            self.assertNotIn("\x1b[", out)
+            self.assertIn("url       ssh://glacier.vctx.io", out)
+            self.assertIn("cloudflared must be installed", out)
 
 
 class SSHConfigTests(unittest.TestCase):
@@ -306,7 +357,7 @@ class SSHConfigTests(unittest.TestCase):
 
             code, out, err = run_cli(["ssh-config", "--write"], env=env)
             self.assertEqual(code, 0)
-            self.assertIn("Added the srv.us block to", out)
+            self.assertIn("Added the *.srv.us block to", out)
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertEqual(config.read_text().count("Host *.srv.us"), 1)
 
@@ -314,6 +365,34 @@ class SSHConfigTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("Already present in", out)
             self.assertEqual(config.read_text().count("Host *.srv.us"), 1)
+
+    def test_ssh_config_explicit_host_uses_backend_proxy_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            state.mkdir(parents=True)
+            (state / "meta").write_text("backend=cloudflared\n")
+            config = home / ".ssh" / "config"
+            env = {**os.environ, "HOME": str(home), "NOOKWIRE_SSH_STATE_DIR": str(state_base)}
+
+            code, out, err = run_cli(["ssh-config", "glacier.vctx.io"], env=env)
+            self.assertEqual(code, 0)
+            self.assertIn("Host glacier.vctx.io", out)
+            self.assertIn("cloudflared access ssh --hostname %h", out)
+
+            code, out, err = run_cli(["ssh-config", "--write", "glacier.vctx.io"], env=env)
+            self.assertEqual(code, 0)
+            self.assertIn("Added the glacier.vctx.io block to", out)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(config.read_text().count("Host glacier.vctx.io"), 1)
+
+            code, out, err = run_cli(["ssh-config", "--write", "glacier.vctx.io"], env=env)
+            self.assertEqual(code, 0)
+            self.assertIn("Already present in", out)
+            self.assertEqual(config.read_text().count("Host glacier.vctx.io"), 1)
 
 
 class StateUnitTests(unittest.TestCase):
