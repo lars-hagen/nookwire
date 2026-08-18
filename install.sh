@@ -16,12 +16,22 @@ VERSION=${NOOKWIRE_SSH_VERSION:-2.1.2}
 PACKAGE=${NOOKWIRE_SSH_PACKAGE:-}
 if [ -z "$PACKAGE" ]; then
   BASE=${NOOKWIRE_SSH_BASE_URL:-git+https://github.com/lars-hagen/nookwire-ssh}
-  REF=$VERSION
-  case "$VERSION" in
-    v*) ;;
-    *) REF="v$VERSION" ;;
+  # A base that already names a ref (…/nookwire-ssh@main, as `upgrade` passes)
+  # is used as-is. Appending the pinned version as well would build
+  # …/nookwire-ssh@main@v2.1.2, which uv cannot parse.
+  case "${BASE#*://}" in
+    *@*)
+      PACKAGE="$BASE"
+      ;;
+    *)
+      REF=$VERSION
+      case "$VERSION" in
+        v*) ;;
+        *) REF="v$VERSION" ;;
+      esac
+      PACKAGE="$BASE@$REF"
+      ;;
   esac
-  PACKAGE="$BASE@$REF"
 fi
 PREFIX=${NOOKWIRE_SSH_PREFIX:-"$HOME/.local"}
 BIN_DIR="$PREFIX/bin"

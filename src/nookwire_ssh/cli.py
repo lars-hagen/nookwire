@@ -28,6 +28,9 @@ DEFAULT_BACKEND = "srvus"
 DEFAULT_PORT = 8022
 DEFAULT_SLOT = 1
 GITHUB_HTTPS = "https://github.com/lars-hagen/nookwire-ssh"
+# uv needs the git+ scheme to treat this as a VCS checkout rather than a URL to
+# a distribution file.
+GITHUB_PACKAGE = f"git+{GITHUB_HTTPS}"
 INSTALLER_URL = "https://raw.githubusercontent.com/lars-hagen/nookwire-ssh"
 # Put the package source on PYTHONPATH so ``sys.executable -m nookwire_ssh.*``
 # subprocesses can import the package even before it is pip-installed.
@@ -788,7 +791,7 @@ def install_spec(ref: str) -> str:
         target = f"v{version}" if version[0].isdigit() else version
     else:
         target = ref
-    base = os.environ.get("NOOKWIRE_SSH_BASE_URL") or GITHUB_HTTPS
+    base = os.environ.get("NOOKWIRE_SSH_BASE_URL") or GITHUB_PACKAGE
     if "@" in base:
         return base
     return f"{base}@{target}"
@@ -807,7 +810,7 @@ def cmd_upgrade(args) -> int:
     )
     # Reinstall from the same ref, not the installer's pinned default, so
     # "upgrade main" actually installs main's package.
-    base_url = os.environ.get("NOOKWIRE_SSH_BASE_URL") or f"{GITHUB_HTTPS}@{ref}"
+    base_url = os.environ.get("NOOKWIRE_SSH_BASE_URL") or f"{GITHUB_PACKAGE}@{ref}"
     # A proxy or HTTP cache can serve a stale copy of the installer. Ask it not
     # to with request headers only; raw.githubusercontent rejects query strings,
     # which would otherwise be the usual cache-busting trick.
