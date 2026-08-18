@@ -80,11 +80,14 @@ export UV_TOOL_BIN_DIR=${UV_TOOL_BIN_DIR:-"$BIN_DIR"}
 export UV_TOOL_DIR=${UV_TOOL_DIR:-"$PREFIX/share/uv/tools"}
 mkdir -p "$BIN_DIR"
 
-# The destination of the console script must be writable and not a symlink or a
-# non-regular file: a stray directory or symlink would let the install clobber
-# something it does not own.
+# The destination of the console script must not be a directory.
+# uv owns this path and installs a symlink into its tool
+# environment, so a symlink or a regular file here is the normal state after a
+# previous install and --force replaces it. Refusing those broke every upgrade.
+# A directory is the one case worth catching, since uv cannot replace it and
+# its error is far less clear than this one.
 for destination in "$UV_TOOL_BIN_DIR/nookwire-ssh"; do
-  if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+  if [ -d "$destination" ]; then
     printf 'nookwire-ssh: refusing unsafe install destination: %s\n' "$destination" >&2
     exit 1
   fi
