@@ -531,31 +531,73 @@ class ConfinedSFTPServer(asyncssh.SFTPServer):
     """SFTP server which rejects paths resolving outside its virtual root."""
 
     def __init__(self, channel: asyncssh.SSHServerChannel, root: Path):
+        # The resolved root is the chroot boundary AsyncSSH enforces (it
+        # realpaths the chroot internally). The configured root is kept
+        # separately as the prefix used to recognize client-supplied absolute
+        # host paths, because clients address the root by its configured,
+        # unresolved spelling (e.g. /var/... which resolves to /private/var
+        # on macOS). The authoritative escape guard always uses the resolved
+        # root.
         self._root_path = os.fsencode(root.resolve())
+        self._root_prefix = os.path.normpath(os.fsencode(root))
+        self._channel = channel
+        self._served = False
         super().__init__(channel, chroot=self._root_path)
 
+    def _is_confined_by(self, path: bytes, root: bytes) -> bool:
+        try:
+            return os.path.commonpath((root, path)) == root
+        except ValueError:
+            return False
+
+    def _is_confined(self, path: bytes) -> bool:
+        return self._is_confined_by(path, self._root_path)
+
+    def _require_confined(self, path: bytes) -> None:
+        if not self._is_confined(path):
+            raise asyncssh.SFTPPermissionDenied("Path resolves outside the SFTP root")
+
+    def _map_requested(self, path: bytes) -> bytes:
+        """Map a client path to a host path within the configured root.
+
+        A path that already names a location under the root (absolute host
+        paths passed by the asyncssh API or legacy clients, matched against
+        the root as it was configured) is kept as that host path; map_path
+        and _map_entry then reject any symlink escape. Every other path is
+        interpreted relative to the SFTP virtual root ("/"), which is how
+        standard SCP clients address the remote namespace after
+        canonicalizing it.
+        """
+        if os.path.isabs(path) and self._is_confined_by(
+            os.path.normpath(path), self._root_prefix
+        ):
+            return os.path.normpath(path)
+        return super().map_path(path)
+
     def map_path(self, path: bytes) -> bytes:
-        # Preserve SSH path semantics while retaining the configured root as
-        # the security boundary: absolute paths name host paths, and relative
-        # paths start at the exposed remote home.
-        mapped = os.path.normpath(path) if os.path.isabs(path) else super().map_path(path)
+        self._served = True
+        mapped = self._map_requested(path)
         resolved = os.path.realpath(mapped)
         self._require_confined(resolved)
         return resolved
 
-    def _require_confined(self, path: bytes) -> None:
-        try:
-            confined = os.path.commonpath((self._root_path, path)) == self._root_path
-        except ValueError:
-            confined = False
-        if not confined:
-            raise asyncssh.SFTPPermissionDenied("Path resolves outside the SFTP root")
-
     def _map_entry(self, path: bytes) -> bytes:
         """Map a directory entry without following its final symlink."""
-        mapped = os.path.normpath(path) if os.path.isabs(path) else super().map_path(path)
+        self._served = True
+        mapped = self._map_requested(path)
         self._require_confined(os.path.realpath(os.path.dirname(mapped)))
         return mapped
+
+    def exit(self) -> None:
+        # OpenSSH scp in SFTP mode reads the channel's exit status and treats
+        # a missing one as failure, so report success for a session that
+        # actually served requests. A session torn down before serving any
+        # request (e.g. by a protocol error) must not be reported as a clean
+        # success.
+        if self._served:
+            with contextlib.suppress(Exception):
+                self._channel.exit(0)
+        return None
 
     def lstat(self, path: bytes) -> os.stat_result:
         return os.lstat(self._map_entry(path))

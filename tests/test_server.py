@@ -11,6 +11,7 @@ import asyncssh
 
 from nookwire_ssh.server import (
     Config,
+    ConfinedSFTPServer,
     TokenSSHServer,
     create_acceptor,
     ensure_host_key,
@@ -343,6 +344,151 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (self.root / "system-relative.txt").read_text(encoding="utf-8"), "system scp"
         )
+
+    async def _scp_askpass_env(self):
+        askpass = Path(self.temporary.name) / "askpass.sh"
+        askpass.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$NOOKWIRE_TEST_PASSWORD\"\n", encoding="utf-8"
+        )
+        askpass.chmod(0o700)
+        return {
+            **os.environ,
+            "DISPLAY": "nookwire:0",
+            "SSH_ASKPASS": str(askpass),
+            "SSH_ASKPASS_REQUIRE": "force",
+            "NOOKWIRE_TEST_PASSWORD": self.password,
+        }
+
+    async def _run_system_scp(self, *extra_args, **kwargs):
+        options = [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-P", str(self.port),
+        ]
+        environment = kwargs.pop("env", await self._scp_askpass_env())
+        scp = await asyncio.create_subprocess_exec(
+            "scp", *options, *extra_args, **kwargs,
+            env=environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await scp.communicate()
+        return scp.returncode, stderr.decode()
+
+    async def test_system_scp_modern_protocol_upload_cases(self):
+        """Modern OpenSSH scp (SFTP protocol, not -O) uploads reliably.
+
+        Regression coverage for: multiple sources into an existing directory,
+        recursive directory upload where the destination child does not yet
+        exist, and single-file upload into a fresh name.
+        """
+        if not shutil.which("scp"):
+            self.skipTest("OpenSSH scp is unavailable")
+
+        source_dir = Path(self.temporary.name) / "src"
+        docs = source_dir / "docs"
+        docs.mkdir(parents=True)
+        (docs / "cred.txt").write_text("secret", encoding="utf-8")
+        nested = docs / "nested"
+        nested.mkdir()
+        (nested / "deep.txt").write_text("deep", encoding="utf-8")
+
+        # 1. Multiple source files into an existing directory.
+        existing = self.root / "existing"
+        existing.mkdir()
+        one = Path(self.temporary.name) / "one.txt"
+        two = Path(self.temporary.name) / "two.txt"
+        one.write_text("one", encoding="utf-8")
+        two.write_text("two", encoding="utf-8")
+        rc, stderr = await self._run_system_scp(
+            str(one), str(two), f"nookwire@127.0.0.1:{existing}"
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual((existing / "one.txt").read_text(encoding="utf-8"), "one")
+        self.assertEqual((existing / "two.txt").read_text(encoding="utf-8"), "two")
+
+        # 2. Recursive directory upload where the destination child does not
+        #    yet exist.
+        target = self.root / "upload-target"
+        target.mkdir()
+        rc, stderr = await self._run_system_scp(
+            "-r", str(source_dir), f"nookwire@127.0.0.1:{target / 'src'}"
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(
+            (target / "src" / "docs" / "cred.txt").read_text(encoding="utf-8"),
+            "secret",
+        )
+        self.assertEqual(
+            (target / "src" / "docs" / "nested" / "deep.txt").read_text(
+                encoding="utf-8"
+            ),
+            "deep",
+        )
+
+        # 3. Single-file upload into a fresh destination name.
+        renamed = self.root / "renamed.txt"
+        rc, stderr = await self._run_system_scp(
+            str(one), f"nookwire@127.0.0.1:{renamed}"
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(renamed.read_text(encoding="utf-8"), "one")
+
+    async def test_system_scp_denied_returns_nonzero_and_reports_status(self):
+        """A denied transfer returns nonzero and the SFTP status is reported.
+
+        Writing through an in-root symlink that escapes the root is rejected
+        at the SFTP layer. This must surface as a non-zero scp exit even
+        though the server goes on to report a clean channel exit status, so
+        the SFTP permission error is never masked as success.
+        """
+        if not shutil.which("scp"):
+            self.skipTest("OpenSSH scp is unavailable")
+
+        source = Path(self.temporary.name) / "deny-source.txt"
+        source.write_text("nope", encoding="utf-8")
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        link = self.root / "escaping-link"
+        link.symlink_to(outside, target_is_directory=True)
+
+        rc, stderr = await self._run_system_scp(
+            str(source), f"nookwire@127.0.0.1:{link / 'pwned.txt'}"
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Permission denied", stderr)
+        self.assertFalse((outside / "pwned.txt").exists())
+
+
+class SFTPServerExitStatusTests(unittest.TestCase):
+    """The SFTP server only reports channel success for sessions it served.
+
+    AsyncSSH calls SFTPServer.exit() on shudown for both clean sessions and
+    sessions cut short before serving anything (for example a protocol
+    error). A success exit status must not be fabricated for the latter, or
+    the SFTP status of a failed/aborted transfer could be masked.
+    """
+
+    def _server(self, temp):
+        root = Path(temp) / "root"
+        root.mkdir()
+        channel = mock.Mock()
+        return ConfinedSFTPServer(channel, root), channel
+
+    def test_no_exit_status_before_serving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server, channel = self._server(temp)
+            server.exit()
+            channel.exit.assert_not_called()
+
+    def test_exit_status_zero_after_serving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server, channel = self._server(temp)
+            server.map_path(os.fsencode("/"))
+            server.exit()
+            channel.exit.assert_called_once_with(0)
 
 
 class HostKeyTests(unittest.TestCase):
