@@ -126,6 +126,20 @@ A successful start saves its backend, root, port, slot, hostname, endpoint, and 
 
 The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gives srv.us a stable hostname. Runtime state, credentials, PID files, and logs are stored under `~/.local/state/nookwire-ssh` by default.
 
+Ephemeral machines can recreate the same tunnel identity when that key is
+missing by setting a secret seed. The seed is never sent to srv.us:
+
+```sh
+export NOOKWIRE_SSH_IDENTITY_SEED='<high-entropy secret scoped to this machine>'
+nookwire-ssh start --backend srvus --slot 1
+```
+
+The seed deterministically creates the Ed25519 tunnel key only when the key file
+does not exist. Existing keys remain authoritative. Reusing both the seed and
+slot recreates the same srv.us hostname after local state is lost. Use a random
+secret, not a public repository name, because anyone with the seed can recreate
+the tunnel identity.
+
 ## Backends
 
 `start --backend` selects the public ingress. The AsyncSSH server is identical across all three; only the tunnel process and the printed connect command change. `status` reports the right command for whichever backend is running.

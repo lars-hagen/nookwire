@@ -16,12 +16,18 @@ import argparse
 import asyncio
 import contextlib
 import getpass
+import hashlib
 import os
 import signal
 import sys
 from pathlib import Path
 
 import asyncssh
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+IDENTITY_SEED_ENV = "NOOKWIRE_SSH_IDENTITY_SEED"
 
 
 class TunnelClient(asyncssh.SSHClient):
@@ -52,7 +58,19 @@ def ensure_key(path: Path) -> None:
         return
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = asyncssh.generate_private_key("ssh-ed25519")
+    seed = os.getenv(IDENTITY_SEED_ENV, "")
+    if seed:
+        private = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(b"nookwire-ssh/srv.us/v1\0" + seed.encode()).digest()
+        )
+        encoded = private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        key = asyncssh.import_private_key(encoded)
+    else:
+        key = asyncssh.generate_private_key("ssh-ed25519")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -64,7 +82,8 @@ def ensure_key(path: Path) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
-    print(f"nookwire-tunnel: created {path}", flush=True)
+    source = IDENTITY_SEED_ENV if seed else "random identity"
+    print(f"nookwire-tunnel: created {path} from {source}", flush=True)
 
 
 async def pump(reader: asyncssh.SSHReader, writer) -> None:

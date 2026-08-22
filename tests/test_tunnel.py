@@ -25,6 +25,28 @@ class ForwardingSSHServer(asyncssh.SSHServer):
 
 
 class TunnelTests(unittest.TestCase):
+    def test_identity_seed_recreates_the_same_key(self):
+        from nookwire_ssh.tunnel import ensure_key
+
+        with tempfile.TemporaryDirectory() as temp:
+            first = Path(temp) / "first"
+            second = Path(temp) / "second"
+            previous = os.environ.get("NOOKWIRE_SSH_IDENTITY_SEED")
+            os.environ["NOOKWIRE_SSH_IDENTITY_SEED"] = "test-only-high-entropy-seed"
+            try:
+                ensure_key(first)
+                ensure_key(second)
+            finally:
+                if previous is None:
+                    os.environ.pop("NOOKWIRE_SSH_IDENTITY_SEED", None)
+                else:
+                    os.environ["NOOKWIRE_SSH_IDENTITY_SEED"] = previous
+            self.assertEqual(
+                asyncssh.read_private_key(first).export_public_key(),
+                asyncssh.read_private_key(second).export_public_key(),
+            )
+            self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+
     def test_tunnel_creates_key_and_forwards_to_local_port(self):
         with tempfile.TemporaryDirectory() as temp:
             asyncio.run(self.check_tunnel_forwarding(Path(temp)))
