@@ -44,6 +44,7 @@ class Config:
     host_key: Path
     shell: str
     accept: bool = False
+    password_auth: bool = True
     allow_tcp_forwarding: bool = False
 
 
@@ -80,7 +81,7 @@ class TokenSSHServer(asyncssh.SSHServer):
         return self.config.authorized_keys.is_file() and not self.config.accept
 
     def password_auth_supported(self) -> bool:
-        return not self.config.accept
+        return self.config.password_auth and not self.config.accept
 
     def validate_password(self, username: str, password: str) -> bool:
         return hmac.compare_digest(
@@ -659,6 +660,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="accepted SSH username (default: current OS user)",
     )
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV, help="environment variable containing the password")
+    parser.add_argument("--no-password", action="store_true", help="disable password authentication and require an authorized key")
     parser.add_argument("--authorized-keys", default="~/.ssh/authorized_keys", help="OpenSSH authorized_keys file")
     parser.add_argument("--host-key", default=str(DEFAULT_HOST_KEY), help="persistent Ed25519 host key path")
     parser.add_argument("--shell", default=None, help="shell used for commands and interactive sessions (default: $SHELL, then bash, then sh)")
@@ -703,7 +705,7 @@ def build_config(args: argparse.Namespace) -> Config:
         raise ValueError("Username must be non-empty and contain no whitespace")
 
     password = os.environ.get(args.password_env, "")
-    if not args.accept and len(password) < 16:
+    if not args.accept and not args.no_password and len(password) < 16:
         raise ValueError(f"{args.password_env} must contain at least 16 characters")
 
     shell = resolve_shell(args.shell)
@@ -719,6 +721,7 @@ def build_config(args: argparse.Namespace) -> Config:
         host_key=Path(args.host_key).expanduser().resolve(),
         shell=str(shell),
         accept=args.accept,
+        password_auth=not args.no_password,
         allow_tcp_forwarding=args.allow_tcp_forwarding,
     )
 

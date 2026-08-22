@@ -93,6 +93,36 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
             result = await connection.run("printf password-fallback", check=True)
         self.assertEqual(result.stdout, "password-fallback")
 
+    async def test_password_authentication_can_be_disabled(self):
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        authorized_keys = Path(self.temporary.name) / "key-only-authorized_keys"
+        authorized_keys.write_bytes(key.export_public_key())
+        acceptor = await self.spawn(
+            authorized_keys=authorized_keys,
+            host_key=Path(self.temporary.name) / "key-only-host_key",
+            password_auth=False,
+        )
+        try:
+            async with await asyncssh.connect(
+                "127.0.0.1",
+                port=acceptor.get_port(),
+                username="nookwire",
+                client_keys=[key],
+                known_hosts=None,
+            ):
+                pass
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await asyncssh.connect(
+                    "127.0.0.1",
+                    port=acceptor.get_port(),
+                    username="nookwire",
+                    password=self.password,
+                    known_hosts=None,
+                )
+        finally:
+            acceptor.close()
+            await acceptor.wait_closed()
+
         with self.assertRaises(asyncssh.PermissionDenied):
             await asyncssh.connect(
                 "127.0.0.1",

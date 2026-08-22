@@ -140,6 +140,9 @@ slot recreates the same srv.us hostname after local state is lost. Use a random
 secret, not a public repository name, because anyone with the seed can recreate
 the tunnel identity.
 
+Use `--no-password` on the server when a public key is the only intended login
+method. Password authentication is then omitted from SSH negotiation.
+
 ## Backends
 
 `start --backend` selects the public ingress. The AsyncSSH server is identical across all three; only the tunnel process and the printed connect command change. `status` reports the right command for whichever backend is running.

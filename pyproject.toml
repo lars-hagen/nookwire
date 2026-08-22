@@ -9,6 +9,7 @@ description = "Temporary SSH, SFTP, and SCP access to ephemeral workspaces"
 requires-python = ">=3.10"
 dependencies = [
     "asyncssh==2.24.0",
+    "cryptography>=39",
     "websockets",
 ]
 
