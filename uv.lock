@@ -191,6 +191,7 @@ name = "nookwire-ssh"
 source = { editable = "." }
 dependencies = [
     { name = "asyncssh" },
+    { name = "cryptography" },
     { name = "websockets", version = "16.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "websockets", version = "17.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -198,6 +199,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "asyncssh", specifier = "==2.24.0" },
+    { name = "cryptography", specifier = ">=39" },
     { name = "websockets" },
 ]
 
