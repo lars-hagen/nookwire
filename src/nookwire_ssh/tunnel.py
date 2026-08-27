@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import getpass
 import hashlib
 import os
 import signal
@@ -25,6 +24,8 @@ from pathlib import Path
 import asyncssh
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from nookwire_ssh.identity import current_username, ensure_username_environment
 
 
 IDENTITY_SEED_ENV = "NOOKWIRE_SSH_IDENTITY_SEED"
@@ -104,6 +105,7 @@ async def run(
     key: Path,
     username: str,
 ) -> int:
+    ensure_username_environment(username)
     ensure_key(key)
 
     stopped = asyncio.Event()
@@ -190,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.local_port,
                 args.slot,
                 Path(args.key).expanduser(),
-                args.username or getpass.getuser(),
+                args.username or current_username(),
             )
         )
     except KeyboardInterrupt:  # pragma: no cover

@@ -1,3 +1,3 @@
 """Nookwire SSH: temporary SSH, SFTP, and SCP access to ephemeral workspaces."""
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"

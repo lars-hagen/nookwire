@@ -123,6 +123,22 @@ def state_dir(state_base):
 
 
 class CLILifecycleTests(unittest.TestCase):
+    @mock.patch("nookwire_ssh.cli.time.sleep")
+    @mock.patch("nookwire_ssh.cli.upterm.read_session", return_value=None)
+    @mock.patch("nookwire_ssh.cli.st.is_running", return_value=True)
+    def test_upterm_session_wait_times_out(self, _running, _session, sleep):
+        result = cli.wait_for_upterm_session(Path("tunnel.pid"), Path("upterm.json"))
+        self.assertIsNone(result)
+        self.assertEqual(sleep.call_count, 40)
+
+    @mock.patch("nookwire_ssh.cli._spawn")
+    @mock.patch("nookwire_ssh.cli.ensure_username_environment", return_value="nookwire")
+    def test_launch_server_supports_uid_without_passwd_entry(self, _username, spawn):
+        args = mock.Mock(accept=False, allow_tcp_forwarding=False)
+        cli.launch_server(args, Path("/workspace"), 8022, "password", Path("/state"))
+        command = spawn.call_args.args[0]
+        self.assertEqual(command[command.index("--username") + 1], "nookwire")
+
     def test_background_start_status_logs_and_stop(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)

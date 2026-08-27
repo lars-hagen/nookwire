@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import getpass
 import importlib.metadata
 import os
 import shutil
@@ -21,7 +20,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from nookwire_ssh import __version__, relay, server, sshconfig, tunnel
+from nookwire_ssh import __version__, relay, server, sshconfig, tunnel, upterm
+from nookwire_ssh.identity import current_username, ensure_username_environment
 import nookwire_ssh.state as st
 
 DEFAULT_BACKEND = "srvus"
@@ -80,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     proxy = sub.add_parser("proxy", description="Bridge stdin/stdout to the cloudflare relay.")
     proxy.add_argument("url")
+
+    upterm_proxy = sub.add_parser(
+        "upterm-proxy", description="Bridge stdin/stdout to an Upterm WSS session."
+    )
+    upterm_proxy.add_argument("url")
 
     sshconfig = sub.add_parser("ssh-config", description="Print or append an ssh block.")
     sshconfig.add_argument("--write", action="store_true")
@@ -220,6 +225,10 @@ def _backend_proxy_command() -> str:
         if endpoint and session:
             wss = normalize_endpoint(endpoint, "wss") or endpoint
             return f"nookwire-ssh proxy {wss}/tunnel/{session}"
+    if backend == "upterm":
+        session = upterm.read_session(st.state_dir() / "upterm.json")
+        if session:
+            return "nookwire-ssh upterm-proxy " + upterm.ssh_proxy_url(session)
     return sshconfig.SRVUS_PROXY_COMMAND
 
 
@@ -238,6 +247,10 @@ def cmd_ssh_config(args) -> int:
 
 def cmd_proxy(args) -> int:
     return relay.main(["client", args.url])
+
+
+def cmd_upterm_proxy(args) -> int:
+    return upterm.main(["client", args.url])
 
 
 def prepare_ssh_dir() -> None:
@@ -263,11 +276,16 @@ def _spawn(command: list[str], environment: dict[str, str], log: Path) -> subpro
 
 
 def launch_server(args, root: Path, port: int, password: str, state) -> subprocess.Popen:
+    username = ensure_username_environment()
     server_flags = []
     if args.accept:
         server_flags.append("--accept")
     if args.allow_tcp_forwarding:
         server_flags.append("--allow-tcp-forwarding")
+    if args.backend == "upterm":
+        server_flags.extend(
+            ["--no-password", "--upterm-ca-keys", str(state / "upterm-ca-keys")]
+        )
     command = [
         sys.executable,
         "-m",
@@ -279,10 +297,15 @@ def launch_server(args, root: Path, port: int, password: str, state) -> subproce
         "--port",
         str(port),
         "--username",
-        getpass.getuser(),
+        username,
         *server_flags,
     ]
-    environment = {**os.environ, "NOOKWIRE_SSH_PASSWORD": password}
+    environment = {
+        **os.environ,
+        "NOOKWIRE_SSH_PASSWORD": password,
+        "USER": username,
+        "LOGNAME": username,
+    }
     return _spawn(command, environment, state / "server.log")
 
 
@@ -365,12 +388,49 @@ def launch_tunnel_cloudflared(args, state) -> subprocess.Popen:
     return _spawn(["cloudflared", "tunnel", "run"], environment, state / "tunnel.log")
 
 
+def launch_tunnel_upterm(args, port: int, state) -> subprocess.Popen:
+    prepare_ssh_dir()
+    key = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+    st.repair_key_permissions(key)
+    endpoint = normalize_endpoint(args.endpoint or upterm.DEFAULT_ENDPOINT, "wss")
+    if endpoint is None:
+        st.stop_one(state / "server.pid")
+        die(f"Invalid --endpoint: {args.endpoint}")
+    command = [
+        sys.executable,
+        "-m",
+        "nookwire_ssh.upterm",
+        "origin",
+        "--endpoint",
+        endpoint,
+        "--local-port",
+        str(port),
+        "--username",
+        ensure_username_environment(),
+        "--key",
+        str(key),
+        "--host-key",
+        str(server.DEFAULT_HOST_KEY),
+        "--authorized-keys",
+        os.path.expanduser("~/.ssh/authorized_keys"),
+        "--ca-keys",
+        str(state / "upterm-ca-keys"),
+        "--session-file",
+        str(state / "upterm.json"),
+    ]
+    if args.accept:
+        command.append("--accept")
+    return _spawn(command, os.environ, state / "tunnel.log")
+
+
 def backend_launch_tunnel(args, port: int, slot: int, session: str, state):
     if args.backend == "srvus":
         return launch_tunnel_srvus(args, port, slot, state)
     if args.backend == "cloudflare":
         return launch_tunnel_cloudflare(args, port, session, state)
-    return launch_tunnel_cloudflared(args, state)
+    if args.backend == "cloudflared":
+        return launch_tunnel_cloudflared(args, state)
+    return launch_tunnel_upterm(args, port, state)
 
 
 def wait_for_srvus_host(tunnel_pid_file: Path, tunnel_log: Path) -> None:
@@ -383,6 +443,17 @@ def wait_for_srvus_host(tunnel_pid_file: Path, tunnel_log: Path) -> None:
         time.sleep(0.5)
 
 
+def wait_for_upterm_session(tunnel_pid_file: Path, session_file: Path):
+    for _ in range(40):
+        if not st.is_running(tunnel_pid_file):
+            return None
+        session = upterm.read_session(session_file)
+        if session:
+            return session
+        time.sleep(0.5)
+    return None
+
+
 def cmd_start(args) -> int:
     # Anything not given explicitly falls back to the last successful start, so
     # a repeat run on the same box needs no arguments. --accept and
@@ -391,8 +462,11 @@ def cmd_start(args) -> int:
     saved = st.read_config()
     if args.backend is None:
         args.backend = saved.get("backend") or DEFAULT_BACKEND
-    if args.backend not in ("srvus", "cloudflare", "cloudflared"):
-        die(f"Unknown backend: {args.backend} (use srvus, cloudflare, or cloudflared)")
+    if args.backend not in ("srvus", "cloudflare", "cloudflared", "upterm"):
+        die(
+            f"Unknown backend: {args.backend} "
+            "(use srvus, cloudflare, cloudflared, or upterm)"
+        )
     if not args.hostname:
         args.hostname = saved.get("hostname") or ""
     if not args.endpoint:
@@ -421,6 +495,13 @@ def cmd_start(args) -> int:
     if args.accept:
         (state / "password").unlink(missing_ok=True)
         password = ""
+    elif args.backend == "upterm":
+        prompt_authorized_key()
+        keys = Path(os.path.expanduser("~/.ssh/authorized_keys"))
+        if not keys.is_file() or not keys.stat().st_size:
+            die("The upterm backend requires an authorized key or --accept")
+        (state / "password").unlink(missing_ok=True)
+        password = ""
     else:
         prompt_authorized_key()
         password = st.generate_password()
@@ -435,60 +516,80 @@ def cmd_start(args) -> int:
         st.kill_untracked(server_process.pid)
         die("Unable to track server process")
 
-    ready = False
-    for _ in range(120):
-        if not st.is_running(server_pid_file):
-            break
-        if st.port_open(port):
-            ready = True
-            break
-        time.sleep(0.5)
-    if not ready:
-        st.stop_one(server_pid_file)
-        print("Server failed to start. Log:", file=sys.stderr)
-        _tail_stderr(server_log, 100)
-        return 1
+    # Every failure below stops what it started before returning or dying.
+    # An *unexpected* exception has no such handler, and the server is a
+    # daemon whose pid file is the only handle on it: one that escapes here
+    # keeps running, unreachable by `stop`, until the box reboots. Both
+    # stop_one calls are idempotent, so unwinding a path that already
+    # cleaned up is harmless.
+    try:
+        ready = False
+        for _ in range(120):
+            if not st.is_running(server_pid_file):
+                break
+            if st.port_open(port):
+                ready = True
+                break
+            time.sleep(0.5)
+        if not ready:
+            st.stop_one(server_pid_file)
+            print("Server failed to start. Log:", file=sys.stderr)
+            _tail_stderr(server_log, 100)
+            return 1
 
-    tunnel_process = backend_launch_tunnel(args, port, slot, session, state)
-    if not st.write_pid(tunnel_pid_file, tunnel_process.pid):
-        st.kill_untracked(tunnel_process.pid)
-        st.stop_one(server_pid_file)
-        die("Unable to track tunnel process")
+        tunnel_process = backend_launch_tunnel(args, port, slot, session, state)
+        if not st.write_pid(tunnel_pid_file, tunnel_process.pid):
+            st.kill_untracked(tunnel_process.pid)
+            st.stop_one(server_pid_file)
+            die("Unable to track tunnel process")
 
-    time.sleep(2)
-    if not st.is_running(tunnel_pid_file):
-        st.stop_one(server_pid_file)
-        tunnel_pid_file.unlink(missing_ok=True)
-        print("Tunnel failed to start. Log:", file=sys.stderr)
-        _tail_stderr(tunnel_log, 100)
-        return 1
+        time.sleep(2)
+        if not st.is_running(tunnel_pid_file):
+            st.stop_one(server_pid_file)
+            tunnel_pid_file.unlink(missing_ok=True)
+            print("Tunnel failed to start. Log:", file=sys.stderr)
+            _tail_stderr(tunnel_log, 100)
+            return 1
 
-    if args.backend == "srvus":
-        wait_for_srvus_host(tunnel_pid_file, tunnel_log)
+        if args.backend == "srvus":
+            wait_for_srvus_host(tunnel_pid_file, tunnel_log)
+        if args.backend == "upterm":
+            if not wait_for_upterm_session(tunnel_pid_file, state / "upterm.json"):
+                st.stop_one(tunnel_pid_file)
+                st.stop_one(server_pid_file)
+                print("Upterm session failed to start. Log:", file=sys.stderr)
+                _tail_stderr(tunnel_log, 100)
+                return 1
 
-    meta = {
-        "backend": args.backend,
-        "port": str(port),
-        "accept": "1" if args.accept else "0",
-        "allow_tcp_forwarding": "1" if args.allow_tcp_forwarding else "0",
-    }
-    if args.backend == "cloudflare":
-        meta["endpoint"] = args.endpoint or ""
-        meta["session"] = session
-    if args.backend == "cloudflared":
-        meta["hostname"] = args.hostname or ""
-    st.write_meta(meta)
-    st.write_config(
-        {
+        meta = {
             "backend": args.backend,
-            "root": str(root),
             "port": str(port),
-            "slot": str(slot),
-            "hostname": args.hostname or "",
-            "endpoint": args.endpoint or "",
-            "token": args.token or "",
+            "accept": "1" if args.accept else "0",
+            "allow_tcp_forwarding": "1" if args.allow_tcp_forwarding else "0",
         }
-    )
+        if args.backend == "cloudflare":
+            meta["endpoint"] = args.endpoint or ""
+            meta["session"] = session
+        if args.backend == "cloudflared":
+            meta["hostname"] = args.hostname or ""
+        if args.backend == "upterm":
+            meta["endpoint"] = args.endpoint or upterm.DEFAULT_ENDPOINT
+        st.write_meta(meta)
+        st.write_config(
+            {
+                "backend": args.backend,
+                "root": str(root),
+                "port": str(port),
+                "slot": str(slot),
+                "hostname": args.hostname or "",
+                "endpoint": args.endpoint or "",
+                "token": args.token or "",
+            }
+        )
+    except BaseException:
+        st.stop_one(tunnel_pid_file)
+        st.stop_one(server_pid_file)
+        raise
 
     _show_status()
     return 0
@@ -504,10 +605,7 @@ def _tail_stderr(path: Path, count: int) -> None:
 
 
 def _ssh_user() -> str:
-    try:
-        return getpass.getuser()
-    except Exception:
-        return "nookwire"
+    return current_username()
 
 
 class _Color:
@@ -601,12 +699,13 @@ def _fallback_line(ssh_user: str, host: str, proxy_command: str) -> str:
 class _Target:
     """Everything needed to build a connect command, once a tunnel is up."""
 
-    def __init__(self, host: str, proxy_command: str, setup_host: str, url: str, note: str = ""):
+    def __init__(self, host: str, proxy_command: str, setup_host: str, url: str, note: str = "", user: str = ""):
         self.host = host
         self.proxy_command = proxy_command
         self.setup_host = setup_host
         self.url = url
         self.note = note
+        self.user = user
 
 
 def connect_target(backend: str, state: Path) -> _Target | None:
@@ -636,6 +735,21 @@ def connect_target(backend: str, state: Path) -> _Target | None:
             f"ssh://{hostname}",
             "cloudflared must be installed on the connecting machine.",
         )
+    if backend == "upterm":
+        session = upterm.read_session(state / "upterm.json")
+        if not session:
+            return None
+        endpoint = session["endpoint"]
+        host = upterm.endpoint_host(endpoint)
+        proxy_url = upterm.ssh_proxy_url(session)
+        return _Target(
+            host,
+            f"nookwire-ssh upterm-proxy {proxy_url}",
+            host,
+            f"ssh://{session['ssh_user']}@{host}:443",
+            "nookwire-ssh must be installed on the connecting machine.",
+            session["ssh_user"],
+        )
     host = st.extract_host(state / "tunnel.log")
     if not host:
         return None
@@ -663,7 +777,7 @@ def _show_status() -> int:
     # them; this stays scannable.
     if target is not None:
         print()
-        print("  connect   " + color.bold(f"ssh {_ssh_user()}@{target.host}"))
+        print("  connect   " + color.bold(f"ssh {target.user or _ssh_user()}@{target.host}"))
         print("            " + color.dim("first time here: nookwire-ssh connect"))
     return 0 if (server_running and tunnel_running) else 1
 
@@ -677,7 +791,7 @@ def cmd_connect(args) -> int:
     if target is None:
         die("No published address yet; check nookwire-ssh status.")
     color = _colorizer()
-    ssh_user = _ssh_user()
+    ssh_user = target.user or _ssh_user()
     print("Run once on the machine you are connecting from:")
     print()
     print("  " + _setup_line(target.setup_host, target.proxy_command))
@@ -836,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         "restart": cmd_restart,
         "connect": cmd_connect,
         "proxy": cmd_proxy,
+        "upterm-proxy": cmd_upterm_proxy,
         "ssh-config": cmd_ssh_config,
         "upgrade": cmd_upgrade,
     }[args.command](args)

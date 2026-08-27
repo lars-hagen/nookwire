@@ -13,6 +13,7 @@ from nookwire_ssh.server import (
     Config,
     ConfinedSFTPServer,
     TokenSSHServer,
+    build_child_environment,
     create_acceptor,
     ensure_host_key,
     sanitize_locale_environment,
@@ -76,6 +77,18 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncssh.PermissionDenied):
             await self.connect("incorrect-password-long")
 
+    def test_child_environment_supports_uid_without_passwd_entry(self):
+        process = mock.Mock(term_type=None)
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("nookwire_ssh.server.pwd.getpwuid", side_effect=KeyError),
+            mock.patch("nookwire_ssh.identity.getpass.getuser", side_effect=KeyError),
+        ):
+            environment = build_child_environment(process, self.config)
+        self.assertEqual(environment["USER"], "nookwire")
+        self.assertEqual(environment["LOGNAME"], "nookwire")
+        self.assertEqual(environment["HOME"], str(self.root))
+
     async def test_authorized_keys_authentication(self):
         key = asyncssh.generate_private_key("ssh-ed25519")
         self.config.authorized_keys.write_bytes(key.export_public_key())
@@ -131,6 +144,22 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
                 client_keys=[key],
                 known_hosts=None,
             )
+
+    def test_upterm_ca_authentication_mode(self):
+        ca_key = asyncssh.generate_private_key("ssh-ed25519")
+        ca_keys = Path(self.temporary.name) / "upterm-ca-keys"
+        ca_keys.write_bytes(ca_key.export_public_key())
+        config = Config(**{**self.config.__dict__, "upterm_ca_keys": ca_keys})
+        server = TokenSSHServer(config)
+        self.assertTrue(server.begin_auth("relay-generated-user"))
+        self.assertTrue(server.public_key_auth_supported())
+        self.assertFalse(server.password_auth_supported())
+        self.assertTrue(server.validate_ca_key("anything", ca_key))
+        self.assertFalse(
+            server.validate_ca_key(
+                "anything", asyncssh.generate_private_key("ssh-ed25519")
+            )
+        )
 
     async def test_accept_skips_authentication(self):
         acceptor = await self.spawn(

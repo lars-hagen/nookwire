@@ -7,7 +7,6 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
-import getpass
 import hmac
 import pwd
 import os
@@ -26,6 +25,7 @@ import asyncssh
 
 
 from nookwire_ssh import __version__ as VERSION
+from nookwire_ssh.identity import current_username, ensure_username_environment
 DEFAULT_PASSWORD_ENV = "NOOKWIRE_SSH_PASSWORD"
 DEFAULT_HOST_KEY = (
     Path(tempfile.gettempdir()) / f"nookwire-ssh-{os.geteuid()}" / "host-key"
@@ -46,6 +46,7 @@ class Config:
     accept: bool = False
     password_auth: bool = True
     allow_tcp_forwarding: bool = False
+    upterm_ca_keys: Path | None = None
 
 
 class TokenSSHServer(asyncssh.SSHServer):
@@ -67,6 +68,10 @@ class TokenSSHServer(asyncssh.SSHServer):
             # Return False to signal that no authentication is required, so
             # the handshake succeeds immediately regardless of credentials.
             return False
+        if self.config.upterm_ca_keys is not None:
+            if self.connection:
+                self.connection.set_authorized_keys(None)
+            return True
         valid_user = hmac.compare_digest(
             username.encode("utf-8"), self.config.username.encode("utf-8")
         )
@@ -78,10 +83,29 @@ class TokenSSHServer(asyncssh.SSHServer):
         return True
 
     def public_key_auth_supported(self) -> bool:
-        return self.config.authorized_keys.is_file() and not self.config.accept
+        return (
+            self.config.upterm_ca_keys is not None
+            or self.config.authorized_keys.is_file()
+        ) and not self.config.accept
 
     def password_auth_supported(self) -> bool:
-        return self.config.password_auth and not self.config.accept
+        return (
+            self.config.password_auth
+            and self.config.upterm_ca_keys is None
+            and not self.config.accept
+        )
+
+    def validate_ca_key(self, username: str, key: asyncssh.SSHKey) -> bool:
+        """Trust only the relay key recorded by the authenticated Upterm origin."""
+        del username
+        path = self.config.upterm_ca_keys
+        if path is None or not path.is_file():
+            return False
+        try:
+            expected = asyncssh.read_public_key(str(path)).export_public_key()
+            return expected == key.export_public_key()
+        except (OSError, ValueError, asyncssh.KeyImportError):
+            return False
 
     def validate_password(self, username: str, password: str) -> bool:
         return hmac.compare_digest(
@@ -286,11 +310,17 @@ def build_child_environment(
 ) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop(config.password_env, None)
-    account = pwd.getpwuid(os.geteuid())
-    environment["USER"] = account.pw_name
-    environment["LOGNAME"] = account.pw_name
+    try:
+        account = pwd.getpwuid(os.geteuid())
+        username = account.pw_name
+        home = account.pw_dir
+    except KeyError:
+        username = current_username(config.username)
+        home = environment.get("HOME") or str(config.root)
+    environment["USER"] = username
+    environment["LOGNAME"] = username
     environment["SHELL"] = config.shell
-    environment.setdefault("HOME", account.pw_dir)
+    environment.setdefault("HOME", home)
     environment["PWD"] = str(config.root)
     if process.term_type is not None:
         # A pty was requested; the term type may be empty when the client has no
@@ -656,7 +686,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8022, help="listen port")
     parser.add_argument(
         "--username",
-        default=getpass.getuser(),
+        default=current_username(),
         help="accepted SSH username (default: current OS user)",
     )
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV, help="environment variable containing the password")
@@ -673,6 +703,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-tcp-forwarding",
         action="store_true",
         help="allow clients to use local TCP forwarding (ssh -L) through the session",
+    )
+    parser.add_argument(
+        "--upterm-ca-keys",
+        default=None,
+        help="accept Upterm user certificates signed by a relay key in this file",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
@@ -696,6 +731,7 @@ def resolve_shell(requested: str | None) -> str:
 
 
 def build_config(args: argparse.Namespace) -> Config:
+    ensure_username_environment(args.username)
     root = Path(args.root).expanduser().resolve(strict=True)
     if not root.is_dir():
         raise ValueError(f"Root is not a directory: {root}")
@@ -705,7 +741,7 @@ def build_config(args: argparse.Namespace) -> Config:
         raise ValueError("Username must be non-empty and contain no whitespace")
 
     password = os.environ.get(args.password_env, "")
-    if not args.accept and not args.no_password and len(password) < 16:
+    if not args.accept and not args.no_password and not args.upterm_ca_keys and len(password) < 16:
         raise ValueError(f"{args.password_env} must contain at least 16 characters")
 
     shell = resolve_shell(args.shell)
@@ -723,6 +759,11 @@ def build_config(args: argparse.Namespace) -> Config:
         accept=args.accept,
         password_auth=not args.no_password,
         allow_tcp_forwarding=args.allow_tcp_forwarding,
+        upterm_ca_keys=(
+            Path(args.upterm_ca_keys).expanduser().resolve()
+            if args.upterm_ca_keys
+            else None
+        ),
     )
 
 

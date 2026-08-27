@@ -1,14 +1,14 @@
 # Nookwire SSH
 
-Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and a pluggable public ingress: [srv.us](https://docs.srv.us/) by default, or a Cloudflare Worker relay, or Cloudflare Tunnel (`cloudflared`).
+Nookwire SSH gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and a pluggable public ingress: [srv.us](https://docs.srv.us/) by default, [Upterm](https://upterm.dev/) over WSS, a Cloudflare Worker relay, or Cloudflare Tunnel (`cloudflared`).
 
-The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. Every backend only carries bytes and never terminates SSH, so SSH's own encryption and authentication run between client and server. As with srv.us, the printed connect commands disable host-key persistence for these disposable environments, so trust in the ingress matches the existing model; do not treat any backend as protection against a hostile relay.
+The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. The srv.us and Cloudflare backends carry opaque SSH bytes end to end. Upterm terminates and re-establishes SSH at its relay, so it uses public keys or `--accept`, not Nookwire passwords, and requires trusting the selected Upterm relay. The printed commands disable host-key persistence for these disposable environments.
 
 Use Nookwire only on systems and workspaces you own or are explicitly authorized to administer. It provides authenticated access with the permissions of the host OS account and is not an OS-level sandbox. Public-key authentication is the recommended default. See [Security model](#security-model) and [SECURITY.md](SECURITY.md) before exposing a workspace.
 
 ## Prerequisites
 
-The remote machine needs Python 3 and uv, and nothing else for the default `srvus` backend: the tunnel speaks SSH through AsyncSSH, which the server already requires, so no OpenSSH client or `ssh-keygen` has to be installed. The `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support; `cloudflare` needs OpenSSH, uv, and Nookwire SSH installed (its `proxy` subcommand is the ProxyCommand); `cloudflared` needs OpenSSH and `cloudflared`.
+The remote machine needs Python 3 and uv, and nothing else for the `srvus` or `upterm` backends. The `cloudflare` backend needs a deployed Worker; the `cloudflared` backend needs the `cloudflared` binary. A connecting machine's requirements depend on the backend (see [Backends](#backends)): `srvus` needs OpenSSH and OpenSSL; `upterm` and `cloudflare` need OpenSSH and Nookwire SSH installed for their WSS ProxyCommand; `cloudflared` needs OpenSSH and `cloudflared`.
 
 ## Install
 
@@ -174,6 +174,18 @@ nookwire-ssh start --backend cloudflare \
 
 `status` prints an `ssh` command whose `ProxyCommand` is `nookwire-ssh proxy <wss-url>`. The connecting machine just installs Nookwire SSH the same way (the curl installer) and needs `uv` on `PATH` for that one install; no script paths to hand-edit. A per-start high-entropy tunnel id in the URL authorizes the session. Billing stays inside the free tier for interactive use: WebSocket messages bill at a 20:1 ratio and hibernation zeroes idle duration.
 
+### upterm (public WSS relay)
+
+Uses Upterm's public relay over outbound WSS on port 443 and keeps Nookwire's local AsyncSSH server, PTY, SFTP/SCP confinement, and forwarding policy:
+
+```sh
+nookwire-ssh start --backend upterm
+```
+
+The backend requires at least one key in `~/.ssh/authorized_keys`, unless `--accept` is explicitly supplied. Password authentication is unavailable because Upterm authenticates the connecting key at its relay and presents a short-lived certificate to Nookwire. The connecting machine needs Nookwire installed for the generated `upterm-proxy` command. A custom compatible relay can be selected with `--endpoint wss://relay.example`.
+
+Unlike the other backends, Upterm terminates SSH and opens a second SSH connection to the local server. Treat the relay as trusted for authentication and confidentiality. Its WSS connection remains useful on hosts which block outbound SSH but permit HTTPS traffic.
+
 ### cloudflared (Cloudflare Tunnel)
 
 Uses `cloudflared` with no per-message billing. Configure a named tunnel whose ingress maps a hostname to `tcp://localhost:PORT`, then pass the hostname and connector token (or set `NOOKWIRE_CLOUDFLARED_TOKEN`):
@@ -279,7 +291,8 @@ The first `start` creates a stable session (tunnel) id under the state directory
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
 - The server generates and reuses an Ed25519 host key in a private per-user temporary directory. The directory must be owned by the server user and not accessible by group or others; a forced setgid or sticky bit is tolerated. Existing keys must have the same owner and mode `0600`.
 - The connection examples disable host-key persistence because this targets short-lived disposable environments.
-- The srvus tunnel does not verify the srv.us host key, matching the previous OpenSSH invocation. The ingress only carries bytes; SSH's own encryption and authentication still run end to end between client and server.
+- The srvus tunnel does not verify the srv.us host key, matching the previous OpenSSH invocation. Its ingress only carries bytes; SSH's own encryption and authentication still run end to end between client and server.
+- The Upterm backend is intentionally different: the relay terminates SSH, checks the original client key, and reconnects using a short-lived certificate. Nookwire pins that connection to the relay key observed inside the verified WSS session, but the relay remains trusted and passwords cannot pass through it.
 - Nookwire should only be run on systems and workspaces the operator owns or is explicitly authorized to administer.
 
 ## Development
