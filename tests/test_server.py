@@ -13,6 +13,7 @@ from nookwire_ssh.server import (
     Config,
     ConfinedSFTPServer,
     TokenSSHServer,
+    build_child_argv,
     build_child_environment,
     create_acceptor,
     ensure_host_key,
@@ -88,6 +89,28 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(environment["USER"], "nookwire")
         self.assertEqual(environment["LOGNAME"], "nookwire")
         self.assertEqual(environment["HOME"], str(self.root))
+        self.assertEqual(environment["PS1"], "[nookwire]$ ")
+
+    def test_synthetic_uid_skips_login_profiles(self):
+        config = Config(**{**self.config.__dict__, "shell": "/bin/bash"})
+        with mock.patch("nookwire_ssh.server.pwd.getpwuid", side_effect=KeyError):
+            self.assertEqual(
+                build_child_argv("", config),
+                ["/bin/bash", "--noprofile", "--norc", "-i"],
+            )
+            self.assertEqual(
+                build_child_argv("printf ok", config),
+                ["/bin/bash", "--noprofile", "--norc", "-c", "printf ok"],
+            )
+
+        process = mock.Mock(term_type="xterm-256color")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("nookwire_ssh.server.pwd.getpwuid", side_effect=KeyError),
+            mock.patch("nookwire_ssh.identity.getpass.getuser", side_effect=KeyError),
+        ):
+            environment = build_child_environment(process, config)
+        self.assertEqual(environment["PS1"], "[nookwire@\\h \\W]\\$ ")
 
     async def test_authorized_keys_authentication(self):
         key = asyncssh.generate_private_key("ssh-ed25519")

@@ -218,11 +218,30 @@ async def pump_child_output(
 
 
 def build_child_argv(command: str, config: Config) -> list[str]:
+    try:
+        pwd.getpwuid(os.geteuid())
+        synthetic_uid = False
+    except KeyError:
+        synthetic_uid = True
+
+    shell_name = os.path.basename(config.shell)
     if command:
+        if synthetic_uid and shell_name == "bash":
+            return [config.shell, "--noprofile", "--norc", "-c", command]
+        if synthetic_uid and shell_name == "zsh":
+            return [config.shell, "-f", "-c", command]
         return [config.shell, "-lc", command]
     # Interactive session: start a login shell so the usual profile scripts run
     # and construct PS1, PATH, etc., matching a normal OpenSSH login.
-    if os.path.basename(config.shell) in ("bash", "zsh"):
+    # A synthetic hosting UID has no passwd entry. Its system profiles commonly
+    # run `id -un` and construct a prompt through NSS, producing repeated errors
+    # and "I have no name!". Preserve the inherited environment and skip those
+    # profiles only for this case.
+    if synthetic_uid and shell_name == "bash":
+        return [config.shell, "--noprofile", "--norc", "-i"]
+    if synthetic_uid and shell_name == "zsh":
+        return [config.shell, "-f", "-i"]
+    if shell_name in ("bash", "zsh"):
         return [config.shell, "-l", "-i"]
     return [config.shell, "-i"]
 
@@ -317,6 +336,13 @@ def build_child_environment(
     except KeyError:
         username = current_username(config.username)
         home = environment.get("HOME") or str(config.root)
+        shell_name = os.path.basename(config.shell)
+        if shell_name == "zsh":
+            environment["PS1"] = f"[{username}@%m %1~]%# "
+        elif shell_name == "bash":
+            environment["PS1"] = f"[{username}@\\h \\W]\\$ "
+        else:
+            environment["PS1"] = f"[{username}]$ "
     environment["USER"] = username
     environment["LOGNAME"] = username
     environment["SHELL"] = config.shell
