@@ -289,7 +289,7 @@ ssh USER@HOSTNAME.srv.us \
 
 Release publication is automated via GitHub Actions using PyPI Trusted Publishing (`.github/workflows/publish.yml`).
 
-The workflow triggers on GitHub Release `published`, builds the sdist and wheel distributions, verifies installation of both `nookwire` and `nookwire-ssh` console scripts, and publishes to PyPI using least-privilege OIDC tokens (`contents: read`, `id-token: write`).
+The workflow triggers on GitHub Release `published`, builds the sdist and wheel distributions, and publishes them to PyPI using least-privilege OIDC tokens (`contents: read`, `id-token: write`). Tests and installation checks run locally before release so the publishing job stays fast.
 
 To configure the PyPI pending publisher:
 - **PyPI project name**: `nookwire`
