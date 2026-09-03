@@ -890,7 +890,7 @@ class PackageAndWorkflowTests(unittest.TestCase):
             "https://github.com/lars-hagen/nookwire/security",
         )
         self.assertEqual(project["readme"], "README.md")
-        self.assertEqual(project["license"]["text"], "MIT")
+        self.assertEqual(project["license"], "MIT")
         self.assertTrue(
             any("lars-hagen" in str(a) for a in project.get("authors", []))
         )
@@ -923,7 +923,7 @@ class PackageAndWorkflowTests(unittest.TestCase):
             "importlib.metadata.version",
             side_effect=importlib.metadata.PackageNotFoundError,
         ):
-            self.assertEqual(cli._version(), "2.3.1")
+            self.assertEqual(cli._version(), cli.__version__)
 
     def test_publish_workflow_shape(self):
         workflow_path = PROJECT / ".github" / "workflows" / "publish.yml"

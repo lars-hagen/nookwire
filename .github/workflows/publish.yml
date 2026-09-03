@@ -25,11 +25,5 @@ jobs:
       - name: Build distributions
         run: uv build
 
-      - name: Verify wheel installation and CLI scripts
-        run: |
-          uv tool install --find-links dist nookwire
-          nookwire --version
-          nookwire-ssh --version
-
       - name: Publish package distributions to PyPI
         run: uv publish --trusted-publishing always

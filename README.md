@@ -174,7 +174,7 @@ nookwire status --json
 Emits stable JSON to stdout without ANSI codes:
 ```json
 {
-  "version": "2.3.1",
+  "version": "2.4.0",
   "backend": "srvus",
   "server_state": "running",
   "server_pid": 12345,
