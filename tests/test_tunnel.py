@@ -47,6 +47,28 @@ class TunnelTests(unittest.TestCase):
             )
             self.assertEqual(first.stat().st_mode & 0o777, 0o600)
 
+    def test_preferred_seed_matches_legacy_seed_in_tunnel(self):
+        from nookwire_ssh.tunnel import ensure_key
+
+        with tempfile.TemporaryDirectory() as temp:
+            legacy_key = Path(temp) / "legacy"
+            preferred_key = Path(temp) / "preferred"
+
+            with unittest.mock.patch.dict(
+                os.environ, {"NOOKWIRE_SSH_IDENTITY_SEED": "common-seed-123"}, clear=True
+            ):
+                ensure_key(legacy_key)
+
+            with unittest.mock.patch.dict(
+                os.environ, {"NOOKWIRE_IDENTITY_SEED": "common-seed-123"}, clear=True
+            ):
+                ensure_key(preferred_key)
+
+            self.assertEqual(
+                asyncssh.read_private_key(legacy_key).export_public_key(),
+                asyncssh.read_private_key(preferred_key).export_public_key(),
+            )
+
     def test_tunnel_creates_key_and_forwards_to_local_port(self):
         with tempfile.TemporaryDirectory() as temp:
             asyncio.run(self.check_tunnel_forwarding(Path(temp)))

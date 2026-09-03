@@ -1,4 +1,4 @@
-name = "nookwire-ssh-relay"
+name = "nookwire-relay"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 workers_dev = true
@@ -12,3 +12,6 @@ class_name = "Relay"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Relay"]
+
+[observability]
+enabled = true

@@ -1,40 +1,61 @@
-# Nookwire SSH relay Worker
+# Nookwire Cloudflare Worker Relay
 
-A Cloudflare Worker that relays SSH over WebSockets, so Nookwire's `cloudflare`
-backend can skip srv.us. It pairs one origin socket (the remote machine) with
-one client socket (the connecting user) per tunnel id and splices raw bytes
-between them. A Durable Object per id is the rendezvous point; the WebSocket
-Hibernation API keeps idle sessions off the compute-duration meter.
+An edge relay running on Cloudflare Workers that proxies SSH traffic over WebSockets. This pairs with `nookwire --backend cloudflare`.
 
-## Deploy
+## Prerequisites
 
-```sh
-cd worker
-npx wrangler deploy
+- [Node.js](https://nodejs.org/) (v18+)
+- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
+- A Cloudflare account
+
+## Quick Start
+
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+2. Authenticate with Cloudflare:
+   ```bash
+   npx wrangler login
+   ```
+
+3. Deploy:
+   ```bash
+   npm run deploy
+   ```
+
+Note the deployed worker URL (e.g. `https://nookwire.<your-subdomain>.workers.dev`).
+
+## Usage with Nookwire
+
+On the host:
+```bash
+nookwire start . 8022 --backend cloudflare --endpoint https://nookwire.<your-subdomain>.workers.dev
 ```
 
-Wrangler prints the deployed URL, e.g. `https://nookwire-ssh-relay.<subdomain>.workers.dev`.
-Use it as the `--endpoint` for the remote machine:
-
-```sh
-nookwire-ssh start --backend cloudflare \
-  --endpoint https://nookwire-ssh-relay.<subdomain>.workers.dev
+On the client:
+```bash
+nookwire connect
 ```
 
-`status` then prints the matching `ssh` command, whose `ProxyCommand` is
-`nookwire-ssh proxy <wss-url>`. The connecting machine just installs Nookwire SSH
-(same curl installer) and needs `uv` on `PATH`.
+## How It Works
 
-## Billing
+1. The host opens a WebSocket to `wss://<worker>/tunnel/<session>?role=origin`
+2. The client connects to `wss://<worker>/tunnel/<session>?role=client`
+3. The Worker pairs the two WebSockets and pumps raw SSH bytes between them
+4. If either party disconnects, the Worker closes the other half and terminates the session
 
-WebSocket messages through a Durable Object are billed as requests at a 20:1
-ratio (100 messages = 5 requests), and hibernation drops idle-time duration
-charges to zero. An interactive SSH session stays comfortably inside the free
-tier (100,000 requests/day). The initial `Upgrade` of each leg is one request.
+Sessions expire after 5 minutes of inactivity if no client connects.
 
-## Security
+## Development
 
-The tunnel id in the path is a high-entropy secret generated per `start`;
-possession is what authorizes a tunnel. Rotate it by restarting Nookwire. The
-Worker only relays bytes and never terminates SSH, so host-key and password or
-public-key authentication are still enforced end to end by the SSH server.
+Run locally:
+```bash
+npm start
+```
+
+This starts a local dev server at `http://localhost:8787`. You can test with:
+```bash
+nookwire start . 8022 --backend cloudflare --endpoint http://localhost:8787
+```

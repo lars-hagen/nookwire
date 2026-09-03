@@ -6,7 +6,7 @@ Security fixes are applied to the latest release and the default branch.
 
 ## Reporting a vulnerability
 
-Please report security issues privately through [GitHub private vulnerability reporting](https://github.com/lars-hagen/nookwire-ssh/security/advisories/new). Do not open a public issue for an undisclosed vulnerability.
+Please report security issues privately through [GitHub private vulnerability reporting](https://github.com/lars-hagen/nookwire/security/advisories/new). Do not open a public issue for an undisclosed vulnerability.
 
 Include the affected version or commit, expected impact, reproduction steps, and any suggested mitigation. Reports will be acknowledged as soon as practical.
 

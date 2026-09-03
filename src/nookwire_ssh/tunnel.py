@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import hashlib
 import os
 import signal
 import sys
@@ -26,9 +25,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from nookwire_ssh.identity import current_username, ensure_username_environment
-
-
-IDENTITY_SEED_ENV = "NOOKWIRE_SSH_IDENTITY_SEED"
+from nookwire_ssh.project_identity import resolve_identity
 
 
 class TunnelClient(asyncssh.SSHClient):
@@ -48,10 +45,14 @@ class TunnelClient(asyncssh.SSHClient):
         print(msg, flush=True)
 
 
-def ensure_key(path: Path) -> None:
+def ensure_key(
+    path: Path, root: Path | None = None, username: str | None = None
+) -> None:
     """Create the tunnel key when missing; reuse it for a stable hostname.
 
     srv.us derives the hostname from this key, so it is written once and kept.
+    Automatic project identity derives a deterministic key from project metadata
+    when no explicit seed or existing key is present.
     """
     if path.exists():
         if path.is_symlink() or not path.is_file():
@@ -59,11 +60,9 @@ def ensure_key(path: Path) -> None:
         return
 
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    seed = os.getenv(IDENTITY_SEED_ENV, "")
-    if seed:
-        private = Ed25519PrivateKey.from_private_bytes(
-            hashlib.sha256(b"nookwire-ssh/srv.us/v1\0" + seed.encode()).digest()
-        )
+    info = resolve_identity(root=root, username=username)
+    if info.derived_bytes is not None:
+        private = Ed25519PrivateKey.from_private_bytes(info.derived_bytes)
         encoded = private.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
@@ -83,7 +82,7 @@ def ensure_key(path: Path) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
-    source = IDENTITY_SEED_ENV if seed else "random identity"
+    source = info.source if info.mode != "random" else "random identity"
     print(f"nookwire-tunnel: created {path} from {source}", flush=True)
 
 
@@ -104,9 +103,10 @@ async def run(
     slot: int,
     key: Path,
     username: str,
+    root: Path | None = None,
 ) -> int:
     ensure_username_environment(username)
-    ensure_key(key)
+    ensure_key(key, root=root, username=username)
 
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -181,9 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slot", type=int, required=True, help="srv.us slot")
     parser.add_argument("--key", required=True, help="tunnel private key path")
     parser.add_argument("--username", default=None, help="tunnel username")
+    parser.add_argument("--root", default=None, help="project root directory")
     args = parser.parse_args(argv)
 
     try:
+        root_path = Path(args.root).resolve() if args.root else None
         return asyncio.run(
             run(
                 args.host,
@@ -193,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.slot,
                 Path(args.key).expanduser(),
                 args.username or current_username(),
+                root=root_path,
             )
         )
     except KeyboardInterrupt:  # pragma: no cover
@@ -200,7 +203,6 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, asyncssh.Error) as error:
         print(f"nookwire-tunnel: {error}", file=sys.stderr, flush=True)
         return 1
-
 
 
 if __name__ == "__main__":

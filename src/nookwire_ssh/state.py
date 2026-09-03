@@ -28,7 +28,29 @@ def state_dir() -> Path:
         "XDG_STATE_HOME",
         os.path.join(os.path.expanduser("~"), ".local", "state"),
     )
-    return Path(os.environ.get("NOOKWIRE_SSH_STATE_DIR", default)) / "nookwire-ssh"
+    base = os.environ.get(
+        "NOOKWIRE_STATE_DIR",
+        os.environ.get("NOOKWIRE_SSH_STATE_DIR", default),
+    )
+    return Path(base) / "nookwire-ssh"
+
+
+def tunnel_key_path(state: Path | None = None) -> Path:
+    """Return the authoritative key path for tunnel authentication.
+
+    For backwards compatibility:
+    1. If a dedicated key already exists at state_dir/tunnel_id_ed25519, use it.
+    2. If a legacy key exists at ~/.ssh/id_ed25519, preserve and use it.
+    3. Otherwise, use the dedicated key path under state_dir for newly generated keys.
+    """
+    st_dir = state if state is not None else state_dir()
+    dedicated = st_dir / "tunnel_id_ed25519"
+    if dedicated.is_file():
+        return dedicated
+    legacy = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+    if legacy.is_file():
+        return legacy
+    return dedicated
 
 
 def setup_state() -> Path:
@@ -66,7 +88,7 @@ def read_pid(pid_file: Path) -> int | None:
     """Return the pid recorded in ``pid_file``, or None if malformed/absent."""
     with contextlib.suppress(OSError):
         fields = pid_file.read_text().split()
-        if len(fields) == 2 and fields[0].isdigit():
+        if fields and fields[0].isdigit():
             return int(fields[0])
     return None
 

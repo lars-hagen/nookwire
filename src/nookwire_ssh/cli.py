@@ -1,10 +1,8 @@
-"""Command-line interface for Nookwire SSH.
+"""Command-line interface for Nookwire.
 
-Port of the original shell launcher to Python. Each subcommand, flag, printed
-string, and the state layout are preserved so existing installs and the test
-assertions keep working. Background server and tunnel processes are launched as
-``[sys.executable, "-m", "nookwire_ssh.server|tunnel"]`` so uv disappears from
-the runtime path entirely.
+Port of the original shell launcher to Python. Background server and tunnel
+processes are launched as ``[sys.executable, "-m", "nookwire_ssh.server|tunnel"]``
+so uv disappears from the runtime path entirely.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.metadata
+import json
 import os
 import shutil
 import subprocess
@@ -20,33 +19,41 @@ import tempfile
 import time
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import asyncssh
+
 from nookwire_ssh import __version__, relay, server, sshconfig, tunnel, upterm
 from nookwire_ssh.identity import current_username, ensure_username_environment
+from nookwire_ssh.project_identity import resolve_identity
 import nookwire_ssh.state as st
 
+CLI_NAME = "nookwire"
 DEFAULT_BACKEND = "srvus"
 DEFAULT_PORT = 8022
 DEFAULT_SLOT = 1
-GITHUB_HTTPS = "https://github.com/lars-hagen/nookwire-ssh"
+GITHUB_HTTPS = "https://github.com/lars-hagen/nookwire"
 # uv needs the git+ scheme to treat this as a VCS checkout rather than a URL to
 # a distribution file.
 GITHUB_PACKAGE = f"git+{GITHUB_HTTPS}"
-INSTALLER_URL = "https://raw.githubusercontent.com/lars-hagen/nookwire-ssh"
+INSTALLER_URL = "https://raw.githubusercontent.com/lars-hagen/nookwire"
 # Put the package source on PYTHONPATH so ``sys.executable -m nookwire_ssh.*``
 # subprocesses can import the package even before it is pip-installed.
 _PKG_SRC = str(Path(__file__).resolve().parent.parent)
 
 
 def _version() -> str:
-    try:
-        return importlib.metadata.version("nookwire-ssh")
-    except Exception:
-        return __version__
+    for pkg in ("nookwire", "nookwire-ssh"):
+        try:
+            return importlib.metadata.version(pkg)
+        except Exception:
+            pass
+    return __version__
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="nookwire-ssh",
+        prog="nookwire",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -65,8 +72,18 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--token")
     start.add_argument("--accept", action="store_true")
     start.add_argument("--allow-tcp-forwarding", action="store_true")
+    start.add_argument(
+        "--batch",
+        action="store_true",
+        help="Noninteractive batch mode; suppress key prompts and tty access.",
+    )
 
-    sub.add_parser("status", description="Print processes, credentials, and connect command.")
+    status = sub.add_parser(
+        "status", description="Print processes, credentials, and connect command."
+    )
+    status.add_argument(
+        "--json", action="store_true", help="Output machine-readable JSON status."
+    )
 
     logs = sub.add_parser("logs", description="Show the last 100 log lines; add -f to follow.")
     logs.add_argument("target", nargs="?", default="all", choices=["all", "server", "tunnel"])
@@ -74,9 +91,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stop", description="Terminate both background processes.")
 
-    sub.add_parser("restart", description="Stop, then start again with the saved settings.")
+    restart = sub.add_parser(
+        "restart", description="Stop, then start again with the saved settings."
+    )
+    restart.add_argument(
+        "--batch",
+        action="store_true",
+        help="Noninteractive batch mode; suppress key prompts.",
+    )
 
-    sub.add_parser("connect", description="Print the commands to run on the connecting machine.")
+    connect = sub.add_parser(
+        "connect", description="Print the commands to run on the connecting machine."
+    )
+    connect.add_argument(
+        "--batch",
+        action="store_true",
+        help="Print a single self-contained SSH command with BatchMode suitable for substitution.",
+    )
+    connect.add_argument(
+        "--json", action="store_true", help="Output machine-readable JSON connection details."
+    )
+
+    identity = sub.add_parser(
+        "identity", description="Print project and tunnel identity information."
+    )
+    identity.add_argument("positional", nargs="*", help="[DIR]")
+    identity.add_argument(
+        "--json", action="store_true", help="Output machine-readable JSON identity."
+    )
 
     proxy = sub.add_parser("proxy", description="Bridge stdin/stdout to the cloudflare relay.")
     proxy.add_argument("url")
@@ -97,9 +139,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def die(message: str) -> None:
-    # SystemExit(message) prints the text to stderr and exits 1. Raising
-    # (rather than returning) guarantees execution stops at the call site
-    # instead of continuing past a fatal condition.
     raise SystemExit(message)
 
 
@@ -129,13 +168,20 @@ def _resolve_positional(start, saved: dict[str, str] | None = None) -> tuple[Pat
     return root, port, slot
 
 
-def prompt_authorized_key() -> None:
+def prompt_authorized_key(batch: bool = False) -> None:
     """Offer to paste a key when none exists, reading from a real terminal.
 
     With ``curl ... | sh`` the process stdin is the piped script, so fall back
     to the controlling terminal at /dev/tty, and skip silently when neither is
-    available.
+    available. Batch mode suppresses this prompt unconditionally.
     """
+    if (
+        batch
+        or os.environ.get("NOOKWIRE_BATCH") == "1"
+        or os.environ.get("NOOKWIRE_SSH_BATCH") == "1"
+    ):
+        return
+
     keys = Path(os.path.expanduser("~/.ssh/authorized_keys"))
     if keys.is_file() and keys.stat().st_size > 0:
         return
@@ -198,8 +244,7 @@ def _key_is_valid(path: Path) -> bool:
             )
         except OSError:
             return False
-    # No OpenSSH here; no backend needs it anymore. Check the wire format:
-    # "TYPE BASE64[ COMMENT]" whose base64 blob names that same type.
+
     try:
         import base64
         import struct
@@ -224,11 +269,11 @@ def _backend_proxy_command() -> str:
         session = st.meta_get("session")
         if endpoint and session:
             wss = normalize_endpoint(endpoint, "wss") or endpoint
-            return f"nookwire-ssh proxy {wss}/tunnel/{session}"
+            return f"nookwire proxy {wss}/tunnel/{session}"
     if backend == "upterm":
         session = upterm.read_session(st.state_dir() / "upterm.json")
         if session:
-            return "nookwire-ssh upterm-proxy " + upterm.ssh_proxy_url(session)
+            return "nookwire upterm-proxy " + upterm.ssh_proxy_url(session)
     return sshconfig.SRVUS_PROXY_COMMAND
 
 
@@ -275,7 +320,7 @@ def _spawn(command: list[str], environment: dict[str, str], log: Path) -> subpro
         )
 
 
-def launch_server(args, root: Path, port: int, password: str, state) -> subprocess.Popen:
+def launch_server(args, root: Path, port: int, password: str, state: Path) -> subprocess.Popen:
     username = ensure_username_environment()
     server_flags = []
     if args.accept:
@@ -320,9 +365,11 @@ def normalize_endpoint(value: str, scheme: str) -> str | None:
     return f"{scheme}://{stripped}"
 
 
-def launch_tunnel_srvus(args, port: int, slot: int, state) -> subprocess.Popen:
+def launch_tunnel_srvus(
+    args, root: Path, port: int, slot: int, state: Path
+) -> subprocess.Popen:
     prepare_ssh_dir()
-    key = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+    key = st.tunnel_key_path(state)
     st.repair_key_permissions(key)
     host = os.environ.get("NOOKWIRE_TUNNEL_HOST", "srv.us")
     try:
@@ -330,6 +377,7 @@ def launch_tunnel_srvus(args, port: int, slot: int, state) -> subprocess.Popen:
         sink_port = int(port_text)
     except ValueError:
         sink_port = 22
+    username = _ssh_user()
     command = [
         sys.executable,
         "-m",
@@ -344,11 +392,15 @@ def launch_tunnel_srvus(args, port: int, slot: int, state) -> subprocess.Popen:
         str(slot),
         "--key",
         str(key),
+        "--username",
+        username,
+        "--root",
+        str(root),
     ]
     return _spawn(command, os.environ, state / "tunnel.log")
 
 
-def launch_tunnel_cloudflare(args, port: int, session: str, state) -> subprocess.Popen:
+def launch_tunnel_cloudflare(args, port: int, session: str, state: Path) -> subprocess.Popen:
     if not args.endpoint:
         st.stop_one(state / "server.pid")
         die("--endpoint is required for the cloudflare backend")
@@ -371,26 +423,28 @@ def launch_tunnel_cloudflare(args, port: int, session: str, state) -> subprocess
     return _spawn(command, os.environ, state / "tunnel.log")
 
 
-def launch_tunnel_cloudflared(args, state) -> subprocess.Popen:
+def launch_tunnel_cloudflared(args, state: Path) -> subprocess.Popen:
     if not shutil.which("cloudflared"):
         st.stop_one(state / "server.pid")
         die("cloudflared is required for the cloudflared backend")
     if not args.hostname:
         st.stop_one(state / "server.pid")
         die("--hostname is required for the cloudflared backend")
-    token = args.token or os.environ.get("NOOKWIRE_CLOUDFLARED_TOKEN", "")
+    token = (
+        args.token
+        or os.environ.get("NOOKWIRE_CLOUDFLARED_TOKEN")
+        or os.environ.get("NOOKWIRE_SSH_CLOUDFLARED_TOKEN", "")
+    )
     if not token:
         st.stop_one(state / "server.pid")
         die("--token or NOOKWIRE_CLOUDFLARED_TOKEN is required for the cloudflared backend")
-    # Pass the token via the environment, not argv, so it is not exposed in
-    # process listings to other local users.
     environment = {**os.environ, "TUNNEL_TOKEN": token}
     return _spawn(["cloudflared", "tunnel", "run"], environment, state / "tunnel.log")
 
 
-def launch_tunnel_upterm(args, port: int, state) -> subprocess.Popen:
+def launch_tunnel_upterm(args, port: int, state: Path) -> subprocess.Popen:
     prepare_ssh_dir()
-    key = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+    key = st.tunnel_key_path(state)
     st.repair_key_permissions(key)
     endpoint = normalize_endpoint(args.endpoint or upterm.DEFAULT_ENDPOINT, "wss")
     if endpoint is None:
@@ -423,9 +477,9 @@ def launch_tunnel_upterm(args, port: int, state) -> subprocess.Popen:
     return _spawn(command, os.environ, state / "tunnel.log")
 
 
-def backend_launch_tunnel(args, port: int, slot: int, session: str, state):
+def backend_launch_tunnel(args, root: Path, port: int, slot: int, session: str, state: Path):
     if args.backend == "srvus":
-        return launch_tunnel_srvus(args, port, slot, state)
+        return launch_tunnel_srvus(args, root, port, slot, state)
     if args.backend == "cloudflare":
         return launch_tunnel_cloudflare(args, port, session, state)
     if args.backend == "cloudflared":
@@ -434,7 +488,6 @@ def backend_launch_tunnel(args, port: int, slot: int, session: str, state):
 
 
 def wait_for_srvus_host(tunnel_pid_file: Path, tunnel_log: Path) -> None:
-    """Wait for srv.us to report the hostname so start can print the connect command."""
     for _ in range(40):
         if not st.is_running(tunnel_pid_file):
             return
@@ -455,11 +508,14 @@ def wait_for_upterm_session(tunnel_pid_file: Path, session_file: Path):
 
 
 def cmd_start(args) -> int:
-    # Anything not given explicitly falls back to the last successful start, so
-    # a repeat run on the same box needs no arguments. --accept and
-    # --allow-tcp-forwarding are deliberately never restored: silently
-    # reinstating a no-auth session would be a nasty surprise.
     saved = st.read_config()
+    batch = bool(
+        getattr(args, "batch", False)
+        or os.environ.get("NOOKWIRE_BATCH") == "1"
+        or os.environ.get("NOOKWIRE_SSH_BATCH") == "1"
+        or saved.get("batch") == "1"
+    )
+
     if args.backend is None:
         args.backend = saved.get("backend") or DEFAULT_BACKEND
     if args.backend not in ("srvus", "cloudflare", "cloudflared", "upterm"):
@@ -472,7 +528,12 @@ def cmd_start(args) -> int:
     if not args.endpoint:
         args.endpoint = saved.get("endpoint") or ""
     if not args.token:
-        args.token = os.environ.get("NOOKWIRE_CLOUDFLARED_TOKEN") or saved.get("token") or ""
+        args.token = (
+            os.environ.get("NOOKWIRE_CLOUDFLARED_TOKEN")
+            or os.environ.get("NOOKWIRE_SSH_CLOUDFLARED_TOKEN")
+            or saved.get("token")
+            or ""
+        )
     root, port, slot = _resolve_positional(args, saved)
     state = st.setup_state()
     server_pid_file = state / "server.pid"
@@ -480,13 +541,21 @@ def cmd_start(args) -> int:
     server_log = state / "server.log"
     tunnel_log = state / "tunnel.log"
 
-    if st.is_running(server_pid_file):
-        die("Server is already running")
-    if st.is_running(tunnel_pid_file):
-        die("Tunnel is already running")
+    server_running = st.is_running(server_pid_file)
+    tunnel_running = st.is_running(tunnel_pid_file)
+    if server_running and tunnel_running:
+        _show_status()
+        return 0
+    if server_running:
+        pid = st.read_pid(server_pid_file)
+        pid_str = f" (pid {pid})" if pid else ""
+        die(f"Server is running{pid_str} but tunnel is stopped; run '{CLI_NAME} stop' before starting")
+    if tunnel_running:
+        pid = st.read_pid(tunnel_pid_file)
+        pid_str = f" (pid {pid})" if pid else ""
+        die(f"Tunnel is running{pid_str} but server is stopped; run '{CLI_NAME} stop' before starting")
+
     for pid_file in (server_pid_file, tunnel_pid_file):
-        # Clear a stale regular pid file; leave a directory in place so a
-        # write_pid against it fails cleanly (the untrackable-process path).
         if not pid_file.is_dir():
             pid_file.unlink(missing_ok=True)
     if st.port_open(port):
@@ -496,14 +565,16 @@ def cmd_start(args) -> int:
         (state / "password").unlink(missing_ok=True)
         password = ""
     elif args.backend == "upterm":
-        prompt_authorized_key()
+        if not batch:
+            prompt_authorized_key(batch=batch)
         keys = Path(os.path.expanduser("~/.ssh/authorized_keys"))
         if not keys.is_file() or not keys.stat().st_size:
             die("The upterm backend requires an authorized key or --accept")
         (state / "password").unlink(missing_ok=True)
         password = ""
     else:
-        prompt_authorized_key()
+        if not batch:
+            prompt_authorized_key(batch=batch)
         password = st.generate_password()
         (state / "password").write_text(password)
 
@@ -516,12 +587,6 @@ def cmd_start(args) -> int:
         st.kill_untracked(server_process.pid)
         die("Unable to track server process")
 
-    # Every failure below stops what it started before returning or dying.
-    # An *unexpected* exception has no such handler, and the server is a
-    # daemon whose pid file is the only handle on it: one that escapes here
-    # keeps running, unreachable by `stop`, until the box reboots. Both
-    # stop_one calls are idempotent, so unwinding a path that already
-    # cleaned up is harmless.
     try:
         ready = False
         for _ in range(120):
@@ -537,7 +602,7 @@ def cmd_start(args) -> int:
             _tail_stderr(server_log, 100)
             return 1
 
-        tunnel_process = backend_launch_tunnel(args, port, slot, session, state)
+        tunnel_process = backend_launch_tunnel(args, root, port, slot, session, state)
         if not st.write_pid(tunnel_pid_file, tunnel_process.pid):
             st.kill_untracked(tunnel_process.pid)
             st.stop_one(server_pid_file)
@@ -561,11 +626,32 @@ def cmd_start(args) -> int:
                 _tail_stderr(tunnel_log, 100)
                 return 1
 
+        key_path = st.tunnel_key_path(state)
+        legacy_key = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+        if key_path == legacy_key and legacy_key.is_file():
+            ident_mode = "key"
+            ident_source = str(legacy_key)
+            ident_fp = ""
+            try:
+                k = asyncssh.read_private_key(legacy_key)
+                ident_fp = k.get_fingerprint()
+            except Exception:
+                pass
+        else:
+            info = resolve_identity(root=root, username=_ssh_user())
+            ident_mode = info.mode
+            ident_source = info.source
+            ident_fp = info.fingerprint
+
         meta = {
             "backend": args.backend,
             "port": str(port),
             "accept": "1" if args.accept else "0",
             "allow_tcp_forwarding": "1" if args.allow_tcp_forwarding else "0",
+            "identity_mode": ident_mode,
+            "identity_source": ident_source,
+            "identity_fingerprint": ident_fp,
+            "key_path": str(key_path),
         }
         if args.backend == "cloudflare":
             meta["endpoint"] = args.endpoint or ""
@@ -584,6 +670,7 @@ def cmd_start(args) -> int:
                 "hostname": args.hostname or "",
                 "endpoint": args.endpoint or "",
                 "token": args.token or "",
+                "batch": "1" if batch else "0",
             }
         )
     except BaseException:
@@ -609,8 +696,6 @@ def _ssh_user() -> str:
 
 
 class _Color:
-    """Tiny ANSI helper; emits nothing when output is not a terminal."""
-
     def __init__(self, enabled: bool) -> None:
         self._on = enabled
 
@@ -645,7 +730,7 @@ def _print_url_row(color: _Color, known: bool, url: str) -> None:
     if known:
         print(f"  url       {url}")
     else:
-        print("  url       pending   " + _Color(sys.stdout.isatty()).dim("(nookwire-ssh logs tunnel -f)"))
+        print("  url       pending   " + _Color(sys.stdout.isatty()).dim("(nookwire logs tunnel -f)"))
 
 
 def _print_auth_rows(color: _Color, state: Path) -> None:
@@ -669,7 +754,6 @@ def _print_auth_rows(color: _Color, state: Path) -> None:
 
 
 def _setup_line(host: str, proxy_command: str) -> str:
-    """One self-contained, idempotent line to add the block to ~/.ssh/config."""
     lines = [
         "Host " + host,
         "  ProxyCommand " + proxy_command,
@@ -697,9 +781,15 @@ def _fallback_line(ssh_user: str, host: str, proxy_command: str) -> str:
 
 
 class _Target:
-    """Everything needed to build a connect command, once a tunnel is up."""
-
-    def __init__(self, host: str, proxy_command: str, setup_host: str, url: str, note: str = "", user: str = ""):
+    def __init__(
+        self,
+        host: str,
+        proxy_command: str,
+        setup_host: str,
+        url: str,
+        note: str = "",
+        user: str = "",
+    ):
         self.host = host
         self.proxy_command = proxy_command
         self.setup_host = setup_host
@@ -709,7 +799,6 @@ class _Target:
 
 
 def connect_target(backend: str, state: Path) -> _Target | None:
-    """Resolve the published address, or None while the tunnel is still coming up."""
     if backend == "cloudflare":
         endpoint = st.meta_get("endpoint")
         session = st.meta_get("session")
@@ -719,10 +808,10 @@ def connect_target(backend: str, state: Path) -> _Target | None:
         wss = normalize_endpoint(endpoint, "wss") or endpoint
         return _Target(
             "nookwire",
-            f"nookwire-ssh proxy {wss}/tunnel/{session}",
+            f"nookwire proxy {wss}/tunnel/{session}",
             "nookwire",
             f"{https}/tunnel/{session}",
-            "nookwire-ssh must be installed on the connecting machine.",
+            "nookwire must be installed on the connecting machine.",
         )
     if backend == "cloudflared":
         hostname = st.meta_get("hostname")
@@ -744,10 +833,10 @@ def connect_target(backend: str, state: Path) -> _Target | None:
         proxy_url = upterm.ssh_proxy_url(session)
         return _Target(
             host,
-            f"nookwire-ssh upterm-proxy {proxy_url}",
+            f"nookwire upterm-proxy {proxy_url}",
             host,
             f"ssh://{session['ssh_user']}@{host}:443",
-            "nookwire-ssh must be installed on the connecting machine.",
+            "nookwire must be installed on the connecting machine.",
             session["ssh_user"],
         )
     host = st.extract_host(state / "tunnel.log")
@@ -766,32 +855,130 @@ def _show_status() -> int:
     backend = st.meta_get("backend") or DEFAULT_BACKEND
     target = connect_target(backend, state)
 
-    print(f"nookwire-ssh {_version()} · {backend}")
+    print(f"nookwire {_version()} · {backend}")
     print()
     print(f"  server    {_proc_row(color, server_running, st.read_pid(server_pid_file))}")
     print(f"  tunnel    {_proc_row(color, tunnel_running, st.read_pid(tunnel_pid_file))}")
     _print_url_row(color, target is not None, target.url if target else "")
     _print_auth_rows(color, state)
-    # The two pasteable commands are long enough to wrap badly, and they are
-    # needed once per connecting machine, not on every status. `connect` prints
-    # them; this stays scannable.
+    ident_mode = st.meta_get("identity_mode") or "random"
+    ident_fp = st.meta_get("identity_fingerprint") or ""
+    if ident_fp:
+        print(f"  identity  {ident_mode} ({ident_fp})")
+    else:
+        print(f"  identity  {ident_mode}")
     if target is not None:
         print()
         print("  connect   " + color.bold(f"ssh {target.user or _ssh_user()}@{target.host}"))
-        print("            " + color.dim("first time here: nookwire-ssh connect"))
+        print("            " + color.dim("first time here: nookwire connect"))
+    return 0 if (server_running and tunnel_running) else 1
+
+
+def _show_status_json() -> int:
+    state = st.state_dir()
+    server_pid_file = state / "server.pid"
+    tunnel_pid_file = state / "tunnel.pid"
+    server_running = st.is_running(server_pid_file)
+    tunnel_running = st.is_running(tunnel_pid_file)
+    backend = st.meta_get("backend") or DEFAULT_BACKEND
+    target = connect_target(backend, state)
+
+    server_pid = st.read_pid(server_pid_file) if server_running else None
+    tunnel_pid = st.read_pid(tunnel_pid_file) if tunnel_running else None
+    ssh_user = target.user if (target and target.user) else _ssh_user()
+
+    accept = st.meta_get("accept") == "1"
+    forwarding = st.meta_get("allow_tcp_forwarding") == "1"
+    password_file = state / "password"
+    if accept:
+        auth_mode = "none"
+    elif password_file.is_file():
+        auth_mode = "password"
+    elif backend == "upterm":
+        auth_mode = "keys"
+    else:
+        auth_mode = "password"
+
+    ident_mode = st.meta_get("identity_mode") or "random"
+    ident_source = st.meta_get("identity_source") or "random"
+    ident_fp = st.meta_get("identity_fingerprint") or ""
+
+    connect_command = None
+    if target is not None:
+        connect_command = _fallback_line(ssh_user, target.host, target.proxy_command)
+
+    data = {
+        "version": _version(),
+        "backend": backend,
+        "server_state": "running" if server_running else "stopped",
+        "server_pid": server_pid,
+        "tunnel_state": "running" if tunnel_running else "stopped",
+        "tunnel_pid": tunnel_pid,
+        "url": target.url if target else None,
+        "host": target.host if target else None,
+        "ssh_username": ssh_user,
+        "auth_mode": auth_mode,
+        "forwarding": forwarding,
+        "identity_mode": ident_mode,
+        "identity_source": ident_source,
+        "identity_fingerprint": ident_fp,
+        "connect_command": connect_command,
+        "server": {
+            "state": "running" if server_running else "stopped",
+            "running": server_running,
+            "pid": server_pid,
+        },
+        "tunnel": {
+            "state": "running" if tunnel_running else "stopped",
+            "running": tunnel_running,
+            "pid": tunnel_pid,
+        },
+        "identity": {
+            "mode": ident_mode,
+            "source": ident_source,
+            "fingerprint": ident_fp,
+        },
+    }
+    sys.stdout.write(json.dumps(data, indent=2) + "\n")
     return 0 if (server_running and tunnel_running) else 1
 
 
 def cmd_connect(args) -> int:
-    del args
     st.setup_state()
     state = st.state_dir()
     backend = st.meta_get("backend") or DEFAULT_BACKEND
     target = connect_target(backend, state)
     if target is None:
-        die("No published address yet; check nookwire-ssh status.")
-    color = _colorizer()
+        die("No published address yet; check nookwire status.")
+
     ssh_user = target.user or _ssh_user()
+    batch_command = (
+        f"ssh {ssh_user}@{target.host} -T -o BatchMode=yes "
+        f"-o 'ProxyCommand={target.proxy_command}' "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        "-o LogLevel=ERROR"
+    )
+
+    if getattr(args, "batch", False):
+        sys.stdout.write(batch_command + "\n")
+        return 0
+
+    if getattr(args, "json", False):
+        data = {
+            "host": target.host,
+            "ssh_username": ssh_user,
+            "setup_host": target.setup_host,
+            "proxy_command": target.proxy_command,
+            "url": target.url,
+            "note": target.note,
+            "command": _fallback_line(ssh_user, target.host, target.proxy_command),
+            "connect_command": _fallback_line(ssh_user, target.host, target.proxy_command),
+            "batch_command": batch_command,
+        }
+        sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        return 0
+
+    color = _colorizer()
     print("Run once on the machine you are connecting from:")
     print()
     print("  " + _setup_line(target.setup_host, target.proxy_command))
@@ -809,9 +996,93 @@ def cmd_connect(args) -> int:
     return 0
 
 
-def cmd_status(args) -> int:
-    del args
+def cmd_identity(args) -> int:
     st.setup_state()
+    state = st.state_dir()
+    pos = getattr(args, "positional", [])
+    root = Path(pos[0]).expanduser().resolve() if pos else Path.cwd().resolve()
+    user = _ssh_user()
+
+    key_path = st.tunnel_key_path(state)
+    legacy_key = Path(os.path.expanduser("~/.ssh/id_ed25519"))
+    dedicated_key = state / "tunnel_id_ed25519"
+
+    if key_path == legacy_key and legacy_key.is_file():
+        mode = "key"
+        source = str(legacy_key)
+        selector_fp = ""
+        warning = None
+        key_exists = True
+        key_fp = None
+        try:
+            k = asyncssh.read_private_key(legacy_key)
+            key_fp = k.get_fingerprint()
+        except Exception:
+            key_fp = None
+    elif dedicated_key.is_file():
+        key_path = dedicated_key
+        key_exists = True
+        mode = st.meta_get("identity_mode") or "dedicated"
+        source = st.meta_get("identity_source") or "dedicated"
+        selector_fp = st.meta_get("identity_fingerprint") or ""
+        warning = None
+        key_fp = None
+        try:
+            k = asyncssh.read_private_key(dedicated_key)
+            key_fp = k.get_fingerprint()
+        except Exception:
+            key_fp = None
+    else:
+        info = resolve_identity(root=root, username=user)
+        mode = info.mode
+        source = info.source
+        selector_fp = info.fingerprint
+        warning = info.warning
+        key_exists = False
+        key_fp = None
+        if info.derived_bytes is not None:
+            try:
+                priv = Ed25519PrivateKey.from_private_bytes(info.derived_bytes)
+                pem = priv.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+                k = asyncssh.import_private_key(pem)
+                key_fp = k.get_fingerprint()
+            except Exception:
+                key_fp = None
+
+    if getattr(args, "json", False):
+        data = {
+            "mode": mode,
+            "source": source,
+            "fingerprint": selector_fp,
+            "selector_fingerprint": selector_fp,
+            "key_path": str(key_path),
+            "key_exists": key_exists,
+            "key_fingerprint": key_fp,
+            "warning": warning,
+        }
+        sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        return 0
+
+    print(f"identity mode:        {mode}")
+    print(f"identity source:      {source}")
+    print(f"selector fingerprint: {selector_fp or 'none'}")
+    print(f"key path:             {key_path}")
+    print(f"key exists:           {'yes' if key_exists else 'no'}")
+    print(f"key fingerprint:      {key_fp or 'none'}")
+    if warning:
+        print()
+        print(f"Warning: {warning}")
+    return 0
+
+
+def cmd_status(args) -> int:
+    st.setup_state()
+    if getattr(args, "json", False):
+        return _show_status_json()
     return _show_status()
 
 
@@ -863,14 +1134,16 @@ def cmd_stop(args) -> int:
     st.stop_one(state / "tunnel.pid")
     st.stop_one(state / "server.pid")
     (state / "meta").unlink(missing_ok=True)
-    print("Nookwire SSH stopped.")
+    print("Nookwire stopped.")
     return 0
 
 
 def cmd_restart(args) -> int:
     st.setup_state()
-    if not st.read_config():
+    saved = st.read_config()
+    if not saved:
         die("Nothing saved to restart; run start with its options once first.")
+    batch = getattr(args, "batch", False) or (saved.get("batch") == "1")
     cmd_stop(args)
     return cmd_start(
         argparse.Namespace(
@@ -883,22 +1156,22 @@ def cmd_restart(args) -> int:
             token=None,
             accept=False,
             allow_tcp_forwarding=False,
+            batch=batch,
         )
     )
 
 
 def install_spec(ref: str) -> str:
-    """Return the package spec for ``uv tool install``.
-
-    NOOKWIRE_SSH_BASE_URL overrides the source (normally the GitHub checkout),
-    and NOOKWIRE_SSH_VERSION pins a specific release tag when set.
-    """
-    version = os.environ.get("NOOKWIRE_SSH_VERSION")
+    version = os.environ.get("NOOKWIRE_VERSION") or os.environ.get("NOOKWIRE_SSH_VERSION")
     if version:
         target = f"v{version}" if version[0].isdigit() else version
     else:
         target = ref
-    base = os.environ.get("NOOKWIRE_SSH_BASE_URL") or GITHUB_PACKAGE
+    base = (
+        os.environ.get("NOOKWIRE_BASE_URL")
+        or os.environ.get("NOOKWIRE_SSH_BASE_URL")
+        or GITHUB_PACKAGE
+    )
     if "@" in base:
         return base
     return f"{base}@{target}"
@@ -906,21 +1179,27 @@ def install_spec(ref: str) -> str:
 
 def cmd_upgrade(args) -> int:
     if not shutil.which("uv"):
-        die("uv is required; install it and re-run `nookwire-ssh upgrade`")
+        die("uv is required; install it and re-run `nookwire upgrade`")
     if shutil.which("curl") is None:
         die("curl is required to upgrade")
 
     ref = args.ref
-    version = os.environ.get("NOOKWIRE_SSH_VERSION") or __version__
-    install_url = (
-        f"{os.environ.get('NOOKWIRE_SSH_INSTALL_URL') or INSTALLER_URL}/{ref}/install.sh"
+    version = (
+        os.environ.get("NOOKWIRE_VERSION")
+        or os.environ.get("NOOKWIRE_SSH_VERSION")
+        or __version__
     )
-    # Reinstall from the same ref, not the installer's pinned default, so
-    # "upgrade main" actually installs main's package.
-    base_url = os.environ.get("NOOKWIRE_SSH_BASE_URL") or f"{GITHUB_PACKAGE}@{ref}"
-    # A proxy or HTTP cache can serve a stale copy of the installer. Ask it not
-    # to with request headers only; raw.githubusercontent rejects query strings,
-    # which would otherwise be the usual cache-busting trick.
+    base_install_url = (
+        os.environ.get("NOOKWIRE_INSTALL_URL")
+        or os.environ.get("NOOKWIRE_SSH_INSTALL_URL")
+        or INSTALLER_URL
+    )
+    install_url = f"{base_install_url}/{ref}/install.sh"
+    base_url = (
+        os.environ.get("NOOKWIRE_BASE_URL")
+        or os.environ.get("NOOKWIRE_SSH_BASE_URL")
+        or f"{GITHUB_PACKAGE}@{ref}"
+    )
     headers = ["-H", "Cache-Control: no-cache", "-H", "Pragma: no-cache"]
     try:
         installer = subprocess.run(
@@ -930,11 +1209,11 @@ def cmd_upgrade(args) -> int:
         )
     except subprocess.CalledProcessError:
         return die(f"Failed to fetch installer from {install_url}")
-    print(f"nookwire-ssh {version} upgrading from {base_url}")
+    print(f"nookwire {version} upgrading from {base_url}")
     completed = subprocess.run(
         ["sh"],
         input=installer.stdout,
-        env={**os.environ, "NOOKWIRE_SSH_BASE_URL": base_url},
+        env={**os.environ, "NOOKWIRE_BASE_URL": base_url, "NOOKWIRE_SSH_BASE_URL": base_url},
     )
     return completed.returncode
 
@@ -949,6 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
         "stop": cmd_stop,
         "restart": cmd_restart,
         "connect": cmd_connect,
+        "identity": cmd_identity,
         "proxy": cmd_proxy,
         "upterm-proxy": cmd_upterm_proxy,
         "ssh-config": cmd_ssh_config,
