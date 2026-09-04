@@ -12,6 +12,7 @@ import asyncssh
 from nookwire_ssh.server import (
     Config,
     ConfinedSFTPServer,
+    HostSFTPServer,
     TokenSSHServer,
     build_child_argv,
     build_child_environment,
@@ -291,7 +292,30 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIn("100000", result.stdout)
 
-    async def test_sftp_is_root_mapped(self):
+    async def test_sftp_host_mode_default(self):
+        (self.root / "source.txt").write_text("hello", encoding="utf-8")
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        async with await self.connect() as connection:
+            async with connection.start_sftp_client() as sftp:
+                self.assertEqual(await sftp.getcwd(), str(self.root.resolve()))
+                # Relative path resolves inside project root
+                async with sftp.open("source.txt", "rb") as source:
+                    self.assertEqual(await source.read(), b"hello")
+                # Absolute path outside project root is accessible in default host mode
+                async with sftp.open(str(outside / "secret.txt"), "rb") as out_file:
+                    self.assertEqual(await out_file.read(), b"secret")
+                await sftp.put(str(self.root / "source.txt"), "nested.txt")
+                async with sftp.open("nested.txt", "rb") as nested:
+                    data = await nested.read()
+                # Writing absolute path outside project root
+                await sftp.put(str(self.root / "source.txt"), str(outside / "from-sftp.txt"))
+        self.assertEqual(data, b"hello")
+        self.assertEqual((self.root / "nested.txt").read_text(encoding="utf-8"), "hello")
+        self.assertEqual((outside / "from-sftp.txt").read_text(encoding="utf-8"), "hello")
+
+    async def test_sftp_confined_mode(self):
         (self.root / "source.txt").write_text("hello", encoding="utf-8")
         outside = Path(self.temporary.name) / "outside"
         outside.mkdir()
@@ -300,27 +324,33 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         inside = self.root / "inside"
         inside.mkdir()
         (self.root / "inside-link").symlink_to(inside, target_is_directory=True)
-        async with await self.connect() as connection:
-            async with connection.start_sftp_client() as sftp:
-                self.assertEqual(await sftp.getcwd(), "/")
-                async with sftp.open(str(self.root / "source.txt"), "rb") as source:
-                    self.assertEqual(await source.read(), b"hello")
-                await sftp.put(str(self.root / "source.txt"), str(self.root / "nested.txt"))
-                async with sftp.open(str(self.root / "nested.txt"), "rb") as nested:
-                    data = await nested.read()
-                with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.open(str(self.root / "outside-link" / "secret.txt"), "rb")
-                attrs = await sftp.lstat(str(self.root / "outside-link"))
-                self.assertIsNotNone(attrs.permissions)
-                with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.readlink(str(self.root / "outside-link"))
-                await sftp.rename(str(self.root / "outside-link"), str(self.root / "renamed-link"))
-                with self.assertRaises(asyncssh.SFTPPermissionDenied):
-                    await sftp.open(str(self.root / "renamed-link" / "secret.txt"), "rb")
-                await sftp.remove(str(self.root / "renamed-link"))
-                with self.assertRaises(asyncssh.SFTPError):
-                    await sftp.rmdir(str(self.root / "inside-link"))
-                await sftp.remove(str(self.root / "inside-link"))
+        acceptor = await self.spawn(confine_sftp=True)
+        port = acceptor.get_port()
+        try:
+            async with await self.connect(port=port) as connection:
+                async with connection.start_sftp_client() as sftp:
+                    self.assertEqual(await sftp.getcwd(), "/")
+                    async with sftp.open(str(self.root / "source.txt"), "rb") as source:
+                        self.assertEqual(await source.read(), b"hello")
+                    await sftp.put(str(self.root / "source.txt"), str(self.root / "nested.txt"))
+                    async with sftp.open(str(self.root / "nested.txt"), "rb") as nested:
+                        data = await nested.read()
+                    with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                        await sftp.open(str(self.root / "outside-link" / "secret.txt"), "rb")
+                    attrs = await sftp.lstat(str(self.root / "outside-link"))
+                    self.assertIsNotNone(attrs.permissions)
+                    with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                        await sftp.readlink(str(self.root / "outside-link"))
+                    await sftp.rename(str(self.root / "outside-link"), str(self.root / "renamed-link"))
+                    with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                        await sftp.open(str(self.root / "renamed-link" / "secret.txt"), "rb")
+                    await sftp.remove(str(self.root / "renamed-link"))
+                    with self.assertRaises(asyncssh.SFTPError):
+                        await sftp.rmdir(str(self.root / "inside-link"))
+                    await sftp.remove(str(self.root / "inside-link"))
+        finally:
+            acceptor.close()
+            await acceptor.wait_closed()
         self.assertEqual(data, b"hello")
         self.assertEqual((self.root / "nested.txt").read_text(encoding="utf-8"), "hello")
         self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "secret")
@@ -518,11 +548,97 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rc, 0, stderr)
         self.assertEqual(renamed.read_text(encoding="utf-8"), "one")
 
+    async def test_system_scp_host_mode_absolute_and_relative(self):
+        """In default host mode, relative paths land in project root and absolute paths reach host."""
+        if not shutil.which("scp"):
+            self.skipTest("OpenSSH scp is unavailable")
+
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        local_src = Path(self.temporary.name) / "local-src.txt"
+        local_src.write_text("content-42", encoding="utf-8")
+
+        # 1. Relative destination lands in project root
+        rc, stderr = await self._run_system_scp(
+            str(local_src), "nookwire@127.0.0.1:relative-landing.txt"
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(
+            (self.root / "relative-landing.txt").read_text(encoding="utf-8"),
+            "content-42",
+        )
+
+        # 2. Absolute destination outside project root succeeds
+        outside_target = outside / "outside-target.txt"
+        rc, stderr = await self._run_system_scp(
+            str(local_src), f"nookwire@127.0.0.1:{outside_target}"
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(
+            outside_target.read_text(encoding="utf-8"),
+            "content-42",
+        )
+
+        # 3. Downloading from outside absolute path succeeds
+        downloaded_out = Path(self.temporary.name) / "downloaded-out.txt"
+        rc, stderr = await self._run_system_scp(
+            f"nookwire@127.0.0.1:{outside_target}", str(downloaded_out)
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(downloaded_out.read_text(encoding="utf-8"), "content-42")
+
+        # 4. Downloading from relative path succeeds
+        downloaded_rel = Path(self.temporary.name) / "downloaded-rel.txt"
+        rc, stderr = await self._run_system_scp(
+            "nookwire@127.0.0.1:relative-landing.txt", str(downloaded_rel)
+        )
+        self.assertEqual(rc, 0, stderr)
+        self.assertEqual(downloaded_rel.read_text(encoding="utf-8"), "content-42")
+
+    async def test_system_scp_confined_mode_outside_access_rejected(self):
+        """In confined mode, relative lands in root but outside host paths are rejected/not written."""
+        if not shutil.which("scp"):
+            self.skipTest("OpenSSH scp is unavailable")
+
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        local_src = Path(self.temporary.name) / "local-src.txt"
+        local_src.write_text("confined-data", encoding="utf-8")
+
+        acceptor = await self.spawn(confine_sftp=True)
+        port = acceptor.get_port()
+        try:
+            saved_port = self.port
+            self.port = port
+            try:
+                # 1. Relative destination lands in root
+                rc, stderr = await self._run_system_scp(
+                    str(local_src), "nookwire@127.0.0.1:confined-rel.txt"
+                )
+                self.assertEqual(rc, 0, stderr)
+                self.assertEqual(
+                    (self.root / "confined-rel.txt").read_text(encoding="utf-8"),
+                    "confined-data",
+                )
+
+                # 2. Absolute destination outside root does not touch outside filesystem
+                outside_target = outside / "should-not-exist.txt"
+                rc, stderr = await self._run_system_scp(
+                    str(local_src), f"nookwire@127.0.0.1:{outside_target}"
+                )
+                self.assertNotEqual(rc, 0, stderr)
+                self.assertFalse(outside_target.exists())
+            finally:
+                self.port = saved_port
+        finally:
+            acceptor.close()
+            await acceptor.wait_closed()
+
     async def test_system_scp_denied_returns_nonzero_and_reports_status(self):
         """A denied transfer returns nonzero and the SFTP status is reported.
 
         Writing through an in-root symlink that escapes the root is rejected
-        at the SFTP layer. This must surface as a non-zero scp exit even
+        at the SFTP layer under confined mode. This must surface as a non-zero scp exit even
         though the server goes on to report a clean channel exit status, so
         the SFTP permission error is never masked as success.
         """
@@ -536,9 +652,21 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
         link = self.root / "escaping-link"
         link.symlink_to(outside, target_is_directory=True)
 
-        rc, stderr = await self._run_system_scp(
-            str(source), f"nookwire@127.0.0.1:{link / 'pwned.txt'}"
-        )
+        acceptor = await self.spawn(confine_sftp=True)
+        port = acceptor.get_port()
+        try:
+            saved_port = self.port
+            self.port = port
+            try:
+                rc, stderr = await self._run_system_scp(
+                    str(source), f"nookwire@127.0.0.1:{link / 'pwned.txt'}"
+                )
+            finally:
+                self.port = saved_port
+        finally:
+            acceptor.close()
+            await acceptor.wait_closed()
+
         self.assertNotEqual(rc, 0)
         self.assertIn("Permission denied", stderr)
         self.assertFalse((outside / "pwned.txt").exists())
@@ -565,12 +693,22 @@ class SFTPServerExitStatusTests(unittest.TestCase):
             server.exit()
             channel.exit.assert_not_called()
 
+            host_server = HostSFTPServer(channel, Path(temp) / "root")
+            host_server.exit()
+            channel.exit.assert_not_called()
+
     def test_exit_status_zero_after_serving(self):
         with tempfile.TemporaryDirectory() as temp:
             server, channel = self._server(temp)
             server.map_path(os.fsencode("/"))
             server.exit()
             channel.exit.assert_called_once_with(0)
+
+            channel_host = mock.Mock()
+            host_server = HostSFTPServer(channel_host, Path(temp) / "root")
+            host_server.map_path(os.fsencode("/some/path"))
+            host_server.exit()
+            channel_host.exit.assert_called_once_with(0)
 
 
 class HostKeyTests(unittest.TestCase):

@@ -47,6 +47,7 @@ class Config:
     password_auth: bool = True
     allow_tcp_forwarding: bool = False
     upterm_ca_keys: Path | None = None
+    confine_sftp: bool = False
 
 
 class TokenSSHServer(asyncssh.SSHServer):
@@ -584,6 +585,32 @@ async def handle_process(process: asyncssh.SSHServerProcess, config: Config) -> 
         process.exit(returncode if returncode >= 0 else 128 - returncode)
 
 
+class HostSFTPServer(asyncssh.SFTPServer):
+    """SFTP server where absolute paths refer to host paths (default mode).
+
+    Relative paths begin in the configured project root, matching shell working directory.
+    Absolute paths refer to actual host absolute paths, matching shell/exec behavior.
+    """
+
+    def __init__(self, channel: asyncssh.SSHServerChannel, root: Path):
+        self._root_path = os.fsencode(root.resolve())
+        self._channel = channel
+        self._served = False
+        super().__init__(channel, chroot=None)
+
+    def map_path(self, path: bytes) -> bytes:
+        self._served = True
+        if os.path.isabs(path):
+            return os.path.normpath(path)
+        return os.path.normpath(os.path.join(self._root_path, path))
+
+    def exit(self) -> None:
+        if self._served:
+            with contextlib.suppress(Exception):
+                self._channel.exit(0)
+        return None
+
+
 class ConfinedSFTPServer(asyncssh.SFTPServer):
     """SFTP server which rejects paths resolving outside its virtual root."""
 
@@ -690,7 +717,9 @@ async def create_acceptor(config: Config) -> asyncssh.SSHAcceptor:
     ensure_host_key(config.host_key)
 
     def sftp_factory(channel: asyncssh.SSHServerChannel) -> asyncssh.SFTPServer:
-        return ConfinedSFTPServer(channel, config.root)
+        if config.confine_sftp:
+            return ConfinedSFTPServer(channel, config.root)
+        return HostSFTPServer(channel, config.root)
 
     return await asyncssh.create_server(
         lambda: TokenSSHServer(config),
@@ -735,6 +764,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="accept Upterm user certificates signed by a relay key in this file",
     )
+    parser.add_argument(
+        "--confine-sftp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="confine SFTP and SCP paths to the project root",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
 
@@ -772,6 +807,14 @@ def build_config(args: argparse.Namespace) -> Config:
 
     shell = resolve_shell(args.shell)
 
+    confine_sftp = args.confine_sftp
+    if confine_sftp is None:
+        raw_env = os.environ.get("NOOKWIRE_CONFINE_SFTP") or os.environ.get("NOOKWIRE_SSH_CONFINE_SFTP")
+        if raw_env is not None:
+            confine_sftp = raw_env.strip().lower() in ("1", "true", "yes")
+        else:
+            confine_sftp = False
+
     return Config(
         root=root,
         host=args.host,
@@ -790,6 +833,7 @@ def build_config(args: argparse.Namespace) -> Config:
             if args.upterm_ca_keys
             else None
         ),
+        confine_sftp=bool(confine_sftp),
     )
 
 

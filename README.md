@@ -2,7 +2,7 @@
 
 Nookwire gives an agent or human temporary SSH command, SFTP, and SCP access to an ephemeral workspace. It uses [AsyncSSH](https://github.com/ronf/asyncssh) for the server and a pluggable public ingress: [srv.us](https://docs.srv.us/) by default, [Upterm](https://upterm.dev/) over WSS, a Cloudflare Worker relay, or Cloudflare Tunnel (`cloudflared`).
 
-The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, maps SFTP and SCP paths into a configured root, and starts shell commands in that root. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. The srv.us and Cloudflare backends carry opaque SSH bytes end to end. Upterm terminates and re-establishes SSH at its relay, so it uses public keys or `--accept`, not Nookwire passwords, and requires trusting the selected Upterm relay. The printed commands disable host-key persistence for these disposable environments.
+The server binds to localhost, authenticates as the host's own OS user with standard `~/.ssh/authorized_keys` or a generated password fallback, starts shell commands in the configured root, and maps SFTP and modern SCP paths to mirror shell visibility (relative paths begin in the project root, absolute paths refer to host filesystem paths). File transfers can optionally be confined to the project root with `--confine-sftp`. Interactive clients get a real login PTY with job control, window resizing, and the account's normal shell and prompt. The srv.us and Cloudflare backends carry opaque SSH bytes end to end. Upterm terminates and re-establishes SSH at its relay, so it uses public keys or `--accept`, not Nookwire passwords, and requires trusting the selected Upterm relay. The printed commands disable host-key persistence for these disposable environments.
 
 Use Nookwire only on systems and workspaces you own or are explicitly authorized to administer. It provides authenticated access with the permissions of the host OS account and is not an OS-level sandbox. Public-key authentication is the recommended default. See [Security model](#security-model) and [SECURITY.md](SECURITY.md) before exposing a workspace.
 
@@ -168,7 +168,7 @@ nookwire status --json
 Emits stable JSON to stdout without ANSI codes:
 ```json
 {
-  "version": "2.4.1",
+  "version": "2.5.0",
   "backend": "srvus",
   "server_state": "running",
   "server_pid": 12345,
@@ -179,6 +179,10 @@ Emits stable JSON to stdout without ANSI codes:
   "ssh_username": "appuser",
   "auth_mode": "password",
   "forwarding": false,
+  "sftp_mode": "host",
+  "sftpMode": "host",
+  "sftp_root": "/marimo",
+  "sftpRoot": "/marimo",
   "identity_mode": "project",
   "identity_source": "git:origin",
   "identity_fingerprint": "8d3e91a0c4f2",
@@ -224,7 +228,7 @@ nookwire start --backend cloudflare \
 
 ### upterm (public WSS relay)
 
-Uses Upterm's public relay over outbound WSS on port 443 and keeps Nookwire's local AsyncSSH server, PTY, SFTP/SCP confinement, and forwarding policy:
+Uses Upterm's public relay over outbound WSS on port 443 and keeps Nookwire's local AsyncSSH server, PTY, SFTP/SCP configuration, and forwarding policy:
 
 ```sh
 nookwire start --backend upterm
@@ -254,7 +258,7 @@ Afterwards:
 ```sh
 ssh USER@HOSTNAME.srv.us
 sftp USER@HOSTNAME.srv.us
-scp -O notebook.py USER@HOSTNAME.srv.us:/notebook.py
+scp notebook.py USER@HOSTNAME.srv.us:notebook.py
 ```
 
 ## Connect through TLS
@@ -273,7 +277,8 @@ ssh USER@HOSTNAME.srv.us \
 - `--accept` disables both, admitting any client without credentials. Only use it where open access is intended.
 - TCP port forwarding is disabled by default; `--allow-tcp-forwarding` enables `ssh -L` through the session.
 - The generated password is removed from command environments.
-- SFTP and SCP are mapped into the configured root. Paths resolving through a symlink outside that root are rejected.
+- By default, SFTP and modern SCP mirror shell visibility: relative paths begin in the configured project root, while absolute paths refer to host filesystem paths subject to OS user permissions.
+- `--confine-sftp` (or `NOOKWIRE_CONFINE_SFTP=1` / `NOOKWIRE_SSH_CONFINE_SFTP=1`) confines SFTP and SCP transfers to the project root virtual namespace and rejects symlink escapes. This limits file-transfer clients to the project directory, but because Nookwire executes shell commands as the host OS user, it does not sandbox shell or exec commands.
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
 - The server generates and reuses an Ed25519 host key in a private per-user directory.
 - The connection examples disable host-key persistence because this targets short-lived disposable environments.

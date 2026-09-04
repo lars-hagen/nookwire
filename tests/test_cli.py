@@ -705,6 +705,8 @@ class ExtendedCLITests(unittest.TestCase):
             self.assertIsNone(data["tunnel"]["pid"])
             self.assertEqual(data["url"], "https://cli-test.srv.us/")
             self.assertEqual(data["host"], "cli-test.srv.us")
+            self.assertEqual(data["sftp_mode"], "host")
+            self.assertEqual(data["sftpMode"], "host")
             self.assertIn("identity", data)
             self.assertIn("mode", data["identity"])
             self.assertIn("connect_command", data)
@@ -863,6 +865,194 @@ class ExtendedCLITests(unittest.TestCase):
                 cmd_upterm = mock_spawn.call_args.args[0]
                 key_idx_up = cmd_upterm.index("--key") + 1
                 self.assertEqual(cmd_upterm[key_idx_up], str(state / "tunnel_id_ed25519"))
+
+    def test_sftp_confinement_flag_parsing_and_launch(self):
+        parser = cli.build_parser()
+        self.assertIs(parser.parse_args(["start", "--confine-sftp"]).confine_sftp, True)
+        self.assertIs(parser.parse_args(["start", "--no-confine-sftp"]).confine_sftp, False)
+        self.assertIsNone(parser.parse_args(["start"]).confine_sftp)
+        self.assertIs(parser.parse_args(["restart", "--confine-sftp"]).confine_sftp, True)
+        self.assertIs(parser.parse_args(["restart", "--no-confine-sftp"]).confine_sftp, False)
+        self.assertIsNone(parser.parse_args(["restart"]).confine_sftp)
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            state = temp / "state"
+            state.mkdir()
+            root = temp / "root"
+            root.mkdir()
+            args = mock.Mock(shell=None, accept=False, allow_tcp_forwarding=False)
+
+            with mock.patch("nookwire_ssh.cli._spawn") as mock_spawn:
+                cli.launch_server(args, root, 8022, "pass", state, confine_sftp=True)
+                child_cmd = mock_spawn.call_args.args[0]
+                self.assertIn("--confine-sftp", child_cmd)
+
+            with mock.patch("nookwire_ssh.cli._spawn") as mock_spawn:
+                cli.launch_server(args, root, 8022, "pass", state, confine_sftp=False)
+                child_cmd = mock_spawn.call_args.args[0]
+                self.assertNotIn("--confine-sftp", child_cmd)
+                self.assertIn("--no-confine-sftp", child_cmd)
+
+    def test_sftp_confinement_precedence_persistence_and_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            state.mkdir(parents=True)
+            root = temp / "root"
+            root.mkdir()
+
+            # 1. Default status output (host mode)
+            (state / "meta").write_text("backend=srvus\n")
+            env = make_env(home, state_base)
+            code, out, _ = run_cli(["status"], env=env)
+            self.assertIn("sftp      host", out)
+
+            code, out_json, _ = run_cli(["status", "--json"], env=env)
+            data = json.loads(out_json)
+            self.assertEqual(data["sftp_mode"], "host")
+            self.assertEqual(data["sftpMode"], "host")
+
+            # 2. Confined mode via metadata
+            (state / "meta").write_text(f"backend=srvus\nconfine_sftp=1\nsftp_root={root}\n")
+            code, out, _ = run_cli(["status"], env=env)
+            self.assertIn("sftp      confined", out)
+
+            code, out_json, _ = run_cli(["status", "--json"], env=env)
+            data = json.loads(out_json)
+            self.assertEqual(data["sftp_mode"], "confined")
+            self.assertEqual(data["sftpMode"], "confined")
+            self.assertEqual(data["sftp_root"], str(root))
+            self.assertEqual(data["sftpRoot"], str(root))
+
+            # 3. Saved configuration remains authoritative after metadata is removed by stop
+            (state / "meta").unlink()
+            (state / "config").write_text(f"backend=srvus\nconfine_sftp=1\nroot={root}\n")
+            code, out, _ = run_cli(["status"], env=env)
+            self.assertIn("sftp      confined", out)
+
+            code, out_json, _ = run_cli(["status", "--json"], env=env)
+            data = json.loads(out_json)
+            self.assertEqual(data["sftp_mode"], "confined")
+            self.assertEqual(data["sftpMode"], "confined")
+
+    @mock.patch("time.sleep")
+    @mock.patch("nookwire_ssh.cli.wait_for_srvus_host")
+    @mock.patch("nookwire_ssh.cli.st.write_pid", return_value=True)
+    @mock.patch("nookwire_ssh.cli.st.port_open")
+    @mock.patch("nookwire_ssh.cli.st.is_running")
+    @mock.patch("nookwire_ssh.cli.prompt_authorized_key")
+    @mock.patch("nookwire_ssh.cli.launch_server")
+    @mock.patch("nookwire_ssh.cli.launch_tunnel_srvus")
+    def test_sftp_confinement_start_restart_env_precedence(
+        self,
+        mock_launch_tunnel,
+        mock_launch_server,
+        _prompt,
+        mock_is_running,
+        mock_port_open,
+        _write_pid,
+        _wait,
+        _sleep,
+    ):
+        proc_server = mock.MagicMock()
+        proc_server.pid = 99999
+        proc_tunnel = mock.MagicMock()
+        proc_tunnel.pid = 99998
+        running = {"server": False, "tunnel": False}
+
+        def fake_launch_server(*a, **kw):
+            running["server"] = True
+            return proc_server
+
+        def fake_launch_tunnel(*a, **kw):
+            running["tunnel"] = True
+            return proc_tunnel
+
+        mock_launch_server.side_effect = fake_launch_server
+        mock_launch_tunnel.side_effect = fake_launch_tunnel
+        mock_is_running.side_effect = lambda p: running["server"] if "server" in p.name else running["tunnel"]
+        mock_port_open.side_effect = lambda p: running["server"]
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            home = temp / "home"
+            home.mkdir()
+            state_base = temp / "state"
+            state = state_dir(state_base)
+            state.mkdir(parents=True)
+            root = temp / "root"
+            root.mkdir()
+            env = make_env(home, state_base)
+
+            def reset_running():
+                running["server"] = False
+                running["tunnel"] = False
+
+            # A. Bare start defaults to confine_sftp=False
+            reset_running()
+            code, _, err = run_cli(["start", str(root)], env=env)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), False)
+            self.assertIn("confine_sftp=0", (state / "config").read_text())
+            self.assertIn("confine_sftp=0", (state / "meta").read_text())
+            self.assertIn("sftp_mode=host", (state / "meta").read_text())
+
+            # B. Legacy env var NOOKWIRE_SSH_CONFINE_SFTP=1
+            reset_running()
+            env_legacy = dict(env, NOOKWIRE_SSH_CONFINE_SFTP="1")
+            code, _, err = run_cli(["start", str(root)], env=env_legacy)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), True)
+            self.assertIn("confine_sftp=1", (state / "config").read_text())
+            self.assertIn("confine_sftp=1", (state / "meta").read_text())
+            self.assertIn("sftp_mode=confined", (state / "meta").read_text())
+
+            # C. Preferred env var NOOKWIRE_CONFINE_SFTP=0 overrides legacy env
+            reset_running()
+            env_both = dict(env_legacy, NOOKWIRE_CONFINE_SFTP="0")
+            code, _, err = run_cli(["start", str(root)], env=env_both)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), False)
+            self.assertIn("confine_sftp=0", (state / "config").read_text())
+            self.assertIn("confine_sftp=0", (state / "meta").read_text())
+
+            # D. CLI flag --confine-sftp overrides env
+            reset_running()
+            code, _, err = run_cli(["start", "--confine-sftp", str(root)], env=env_both)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), True)
+            self.assertIn("confine_sftp=1", (state / "config").read_text())
+            self.assertIn("confine_sftp=1", (state / "meta").read_text())
+
+            # E. Explicit negative flag overrides an enabled environment variable
+            reset_running()
+            env_confined = dict(env, NOOKWIRE_CONFINE_SFTP="1")
+            code, _, err = run_cli(["start", "--no-confine-sftp", str(root)], env=env_confined)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), False)
+            self.assertIn("confine_sftp=0", (state / "config").read_text())
+            self.assertIn("confine_sftp=0", (state / "meta").read_text())
+
+            # F. Restart preserves saved confine_sftp=1
+            (state / "config").write_text(f"backend=srvus\nroot={root}\nport=8022\nslot=1\nconfine_sftp=1\n")
+            reset_running()
+            code, _, err = run_cli(["restart"], env=env)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), True)
+            self.assertIn("confine_sftp=1", (state / "config").read_text())
+            self.assertIn("confine_sftp=1", (state / "meta").read_text())
+
+            # G. Restart with explicit --no-confine-sftp overrides saved config
+            reset_running()
+            code, _, err = run_cli(["restart", "--no-confine-sftp"], env=env)
+            self.assertEqual(code, 0, err)
+            self.assertIs(mock_launch_server.call_args.kwargs.get("confine_sftp"), False)
+            self.assertIn("confine_sftp=0", (state / "config").read_text())
+            self.assertIn("confine_sftp=0", (state / "meta").read_text())
 
 
 class PackageAndWorkflowTests(unittest.TestCase):

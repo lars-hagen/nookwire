@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--accept", action="store_true")
     start.add_argument("--allow-tcp-forwarding", action="store_true")
     start.add_argument(
+        "--confine-sftp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Confine SFTP and modern SCP to the configured project root.",
+    )
+    start.add_argument(
         "--batch",
         action="store_true",
         help="Noninteractive batch mode; suppress key prompts and tty access.",
@@ -98,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch",
         action="store_true",
         help="Noninteractive batch mode; suppress key prompts.",
+    )
+    restart.add_argument(
+        "--confine-sftp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override saved SFTP confinement setting.",
     )
 
     connect = sub.add_parser(
@@ -320,14 +332,27 @@ def _spawn(command: list[str], environment: dict[str, str], log: Path) -> subpro
         )
 
 
-def launch_server(args, root: Path, port: int, password: str, state: Path) -> subprocess.Popen:
+def launch_server(
+    args,
+    root: Path,
+    port: int,
+    password: str,
+    state: Path,
+    confine_sftp: bool | None = None,
+) -> subprocess.Popen:
     username = ensure_username_environment()
     server_flags = []
-    if args.accept:
+    if getattr(args, "accept", False):
         server_flags.append("--accept")
-    if args.allow_tcp_forwarding:
+    if getattr(args, "allow_tcp_forwarding", False):
         server_flags.append("--allow-tcp-forwarding")
-    if args.backend == "upterm":
+    is_confined = (
+        confine_sftp
+        if confine_sftp is not None
+        else (getattr(args, "confine_sftp", None) is True)
+    )
+    server_flags.append("--confine-sftp" if is_confined else "--no-confine-sftp")
+    if getattr(args, "backend", None) == "upterm":
         server_flags.extend(
             ["--no-password", "--upterm-ca-keys", str(state / "upterm-ca-keys")]
         )
@@ -535,6 +560,18 @@ def cmd_start(args) -> int:
             or ""
         )
     root, port, slot = _resolve_positional(args, saved)
+    confine_sftp_arg = getattr(args, "confine_sftp", None)
+    if confine_sftp_arg is not None:
+        confine_sftp = bool(confine_sftp_arg)
+    else:
+        raw_env = os.environ.get("NOOKWIRE_CONFINE_SFTP") or os.environ.get(
+            "NOOKWIRE_SSH_CONFINE_SFTP"
+        )
+        if raw_env is not None:
+            confine_sftp = raw_env.strip().lower() in ("1", "true", "yes")
+        else:
+            confine_sftp = saved.get("confine_sftp") == "1"
+
     state = st.setup_state()
     server_pid_file = state / "server.pid"
     tunnel_pid_file = state / "tunnel.pid"
@@ -582,7 +619,9 @@ def cmd_start(args) -> int:
     server_log.write_text("")
     tunnel_log.write_text("")
 
-    server_process = launch_server(args, root, port, password, state)
+    server_process = launch_server(
+        args, root, port, password, state, confine_sftp=confine_sftp
+    )
     if not st.write_pid(server_pid_file, server_process.pid):
         st.kill_untracked(server_process.pid)
         die("Unable to track server process")
@@ -648,6 +687,9 @@ def cmd_start(args) -> int:
             "port": str(port),
             "accept": "1" if args.accept else "0",
             "allow_tcp_forwarding": "1" if args.allow_tcp_forwarding else "0",
+            "confine_sftp": "1" if confine_sftp else "0",
+            "sftp_mode": "confined" if confine_sftp else "host",
+            "sftp_root": str(root),
             "identity_mode": ident_mode,
             "identity_source": ident_source,
             "identity_fingerprint": ident_fp,
@@ -671,6 +713,7 @@ def cmd_start(args) -> int:
                 "endpoint": args.endpoint or "",
                 "token": args.token or "",
                 "batch": "1" if batch else "0",
+                "confine_sftp": "1" if confine_sftp else "0",
             }
         )
     except BaseException:
@@ -751,6 +794,13 @@ def _print_auth_rows(color: _Color, state: Path) -> None:
         print("  forward   enabled")
     else:
         print("  forward   disabled " + color.dim("(--allow-tcp-forwarding)"))
+    confine = st.meta_get("confine_sftp")
+    if not confine:
+        confine = st.read_config().get("confine_sftp")
+    if confine == "1":
+        print("  sftp      confined " + color.dim("(--confine-sftp)"))
+    else:
+        print("  sftp      host")
 
 
 def _setup_line(host: str, proxy_command: str) -> str:
@@ -889,6 +939,11 @@ def _show_status_json() -> int:
 
     accept = st.meta_get("accept") == "1"
     forwarding = st.meta_get("allow_tcp_forwarding") == "1"
+    confine = st.meta_get("confine_sftp")
+    if not confine:
+        confine = st.read_config().get("confine_sftp")
+    sftp_mode = "confined" if confine == "1" else "host"
+    sftp_root = st.meta_get("sftp_root") or st.read_config().get("root")
     password_file = state / "password"
     if accept:
         auth_mode = "none"
@@ -919,6 +974,10 @@ def _show_status_json() -> int:
         "ssh_username": ssh_user,
         "auth_mode": auth_mode,
         "forwarding": forwarding,
+        "sftp_mode": sftp_mode,
+        "sftpMode": sftp_mode,
+        "sftp_root": sftp_root,
+        "sftpRoot": sftp_root,
         "identity_mode": ident_mode,
         "identity_source": ident_source,
         "identity_fingerprint": ident_fp,
@@ -1144,6 +1203,7 @@ def cmd_restart(args) -> int:
     if not saved:
         die("Nothing saved to restart; run start with its options once first.")
     batch = getattr(args, "batch", False) or (saved.get("batch") == "1")
+    confine_sftp = getattr(args, "confine_sftp", None)
     cmd_stop(args)
     return cmd_start(
         argparse.Namespace(
@@ -1157,6 +1217,7 @@ def cmd_restart(args) -> int:
             accept=False,
             allow_tcp_forwarding=False,
             batch=batch,
+            confine_sftp=confine_sftp,
         )
     )
 
