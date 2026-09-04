@@ -6,19 +6,19 @@ set -eu
 # beside a launcher anymore, so the whole install is a single `uv tool install`.
 #
 # Env overrides:
-#   NOOKWIRE_VERSION (alias: NOOKWIRE_SSH_VERSION)     pin a release tag (e.g. 2.4.0) instead of the default.
+#   NOOKWIRE_VERSION (alias: NOOKWIRE_SSH_VERSION)     pin a release tag (e.g. 2.4.1) instead of the default.
 #   NOOKWIRE_BASE_URL (alias: NOOKWIRE_SSH_BASE_URL)   override the source (repo URL/path) for the package.
 #   NOOKWIRE_PACKAGE (alias: NOOKWIRE_SSH_PACKAGE)     fully override the `uv tool install` package spec.
 #   NOOKWIRE_PREFIX (alias: NOOKWIRE_SSH_PREFIX)       install console scripts into $PREFIX/bin.
 #   UV_TOOL_DIR / UV_TOOL_BIN_DIR                      standard uv tool isolation (honored).
 
-VERSION=${NOOKWIRE_VERSION:-${NOOKWIRE_SSH_VERSION:-2.4.0}}
+VERSION=${NOOKWIRE_VERSION:-${NOOKWIRE_SSH_VERSION:-2.4.1}}
 PACKAGE=${NOOKWIRE_PACKAGE:-${NOOKWIRE_SSH_PACKAGE:-}}
 if [ -z "$PACKAGE" ]; then
   BASE=${NOOKWIRE_BASE_URL:-${NOOKWIRE_SSH_BASE_URL:-git+https://github.com/lars-hagen/nookwire}}
   # A base that already names a ref (…/nookwire@main, as `upgrade` passes)
   # is used as-is. Appending the pinned version as well would build
-  # …/nookwire@main@v2.4.0, which uv cannot parse.
+  # …/nookwire@main@v2.4.1, which uv cannot parse.
   case "${BASE#*://}" in
     *@*)
       PACKAGE="$BASE"

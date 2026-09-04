@@ -12,25 +12,23 @@ The remote machine needs Python 3 and uv, and nothing else for the `srvus` or `u
 
 ## Install
 
-### Post-publication (PyPI)
+### PyPI
 
-Once published to PyPI, install using `uv tool install`:
+Install Nookwire with `uv`:
 
 ```sh
 uv tool install nookwire
 ```
 
-Both `nookwire` (primary) and `nookwire-ssh` (legacy alias) console scripts are installed.
+### GitHub installer
 
-### Git installer
-
-Until PyPI publication, or to run directly from the GitHub repository:
+To install the current GitHub version directly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire/main/install.sh | sh
 ```
 
-Run it on the remote machine you want to expose. It installs `nookwire` as a [uv tool](https://docs.astral.sh/uv/reference/cli/#uv-tool) from the Git repository, dropping both `nookwire` and `nookwire-ssh` console scripts into `~/.local/bin`; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+Run it on the remote machine you want to expose. It installs `nookwire` as a [uv tool](https://docs.astral.sh/uv/reference/cli/#uv-tool) from the Git repository into `~/.local/bin`; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
 
 Once installed, `nookwire upgrade` re-runs the installer in place (`nookwire upgrade REF` pins a branch or tag; default `main`). Background processes are launched as `sys.executable -m nookwire_ssh.server` / `nookwire_ssh.tunnel`, so uv is never needed at runtime. Restart a running server with `nookwire restart` to pick up new code.
 
@@ -48,13 +46,9 @@ curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire/main/install.sh
   | sh -s -- start . 8022 1
 ```
 
-### Compatibility
+### Upgrading from the old command
 
-Nookwire preserves full backward compatibility:
-- The command `nookwire-ssh` is installed as a compatibility symlink/alias invoking `nookwire`.
-- The internal Python package remains `nookwire_ssh`.
-- Runtime state remains at `~/.local/state/nookwire-ssh` (or `$NOOKWIRE_STATE_DIR` / `$NOOKWIRE_SSH_STATE_DIR`).
-- Legacy environment variables (`NOOKWIRE_SSH_*`) are supported everywhere alongside preferred `NOOKWIRE_*` variables.
+Existing installations can run `nookwire-ssh upgrade` once to move to Nookwire. The old command remains temporarily as a deprecated bridge and prints a warning directing users to `nookwire`. Existing state and environment settings continue to work.
 
 ## Start
 
@@ -129,10 +123,10 @@ srv.us derives the assigned public endpoint from the client's tunnel key and slo
 
 ### Identity Hierarchy
 
-When `~/.ssh/id_ed25519` does not exist, Nookwire determines tunnel identity using this strict hierarchy:
+When no existing Nookwire identity key exists, Nookwire determines tunnel identity using this strict hierarchy:
 
 1. **Explicit secret seed** (`NOOKWIRE_IDENTITY_SEED`, alias `NOOKWIRE_SSH_IDENTITY_SEED`):
-   Deterministic derivation using `sha256(b"nookwire-ssh/srv.us/v1\0" + seed)`. Keeps byte-for-byte backward compatibility with existing seeds.
+   Uses the established deterministic derivation and keeps byte-for-byte compatibility with existing seeds.
 2. **Explicit non-secret identity** (`NOOKWIRE_IDENTITY`, alias `NOOKWIRE_SSH_IDENTITY`):
    Derives identity from `${username}@${NOOKWIRE_IDENTITY}`.
 3. **Normalized Git origin**:
@@ -174,7 +168,7 @@ nookwire status --json
 Emits stable JSON to stdout without ANSI codes:
 ```json
 {
-  "version": "2.4.0",
+  "version": "2.4.1",
   "backend": "srvus",
   "server_state": "running",
   "server_pid": 12345,

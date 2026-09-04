@@ -1236,5 +1236,14 @@ def main(argv: list[str] | None = None) -> int:
     }[args.command](args)
 
 
+def deprecated_main(argv: list[str] | None = None) -> int:
+    """Run the legacy command while directing users to the current name."""
+    print(
+        "nookwire-ssh is deprecated; use `nookwire` instead.",
+        file=sys.stderr,
+    )
+    return main(argv)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

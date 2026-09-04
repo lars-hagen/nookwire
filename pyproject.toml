@@ -44,7 +44,7 @@ Security = "https://github.com/lars-hagen/nookwire/security"
 
 [project.scripts]
 nookwire = "nookwire_ssh.cli:main"
-nookwire-ssh = "nookwire_ssh.cli:main"
+nookwire-ssh = "nookwire_ssh.cli:deprecated_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

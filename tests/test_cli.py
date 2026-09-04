@@ -877,7 +877,10 @@ class PackageAndWorkflowTests(unittest.TestCase):
         project = data["project"]
         self.assertEqual(project["name"], "nookwire")
         self.assertEqual(project["scripts"]["nookwire"], "nookwire_ssh.cli:main")
-        self.assertEqual(project["scripts"]["nookwire-ssh"], "nookwire_ssh.cli:main")
+        self.assertEqual(
+            project["scripts"]["nookwire-ssh"],
+            "nookwire_ssh.cli:deprecated_main",
+        )
         self.assertIn("urls", project)
         self.assertEqual(
             project["urls"]["Repository"], "https://github.com/lars-hagen/nookwire"
@@ -924,6 +927,19 @@ class PackageAndWorkflowTests(unittest.TestCase):
             side_effect=importlib.metadata.PackageNotFoundError,
         ):
             self.assertEqual(cli._version(), cli.__version__)
+
+    def test_legacy_command_warns_and_delegates(self):
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "main", return_value=7) as delegated:
+            with contextlib.redirect_stderr(stderr):
+                result = cli.deprecated_main(["status"])
+
+        self.assertEqual(result, 7)
+        delegated.assert_called_once_with(["status"])
+        self.assertEqual(
+            stderr.getvalue(),
+            "nookwire-ssh is deprecated; use `nookwire` instead.\n",
+        )
 
     def test_publish_workflow_shape(self):
         workflow_path = PROJECT / ".github" / "workflows" / "publish.yml"

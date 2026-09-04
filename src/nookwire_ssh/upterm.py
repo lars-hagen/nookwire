@@ -309,7 +309,7 @@ async def run_origin_once(args: argparse.Namespace) -> bool:
         _write_json_atomic(args.session_file, published)
         proxy = session_proxy_url(published)
         log(f"session ready: ssh {session['ssh_user']}@{endpoint_host(endpoint)}")
-        log(f"client proxy: nookwire-ssh upterm-proxy {proxy}")
+        log(f"client proxy: nookwire upterm-proxy {proxy}")
         await connection.wait_closed()
         return True
     finally:

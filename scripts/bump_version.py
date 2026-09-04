@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bump the nookwire-ssh version.
+"""Bump the Nookwire version.
 
 Usage: uv run scripts/bump_version.py 1.7.0
 
@@ -30,7 +30,7 @@ def replace(path: Path, pattern: re.Pattern, replacement: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Bump the nookwire-ssh version")
+    ap = argparse.ArgumentParser(description="Bump the Nookwire version")
     ap.add_argument("version", help="new version, e.g. 1.7.0")
     args = ap.parse_args()
 

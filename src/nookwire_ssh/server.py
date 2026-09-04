@@ -808,13 +808,13 @@ async def serve(config: Config) -> None:
     )
     if config.accept:
         print(
-            "nookwire-ssh: --accept set; anyone can connect without "
+            "nookwire: --accept set; anyone can connect without "
             "authentication",
             flush=True,
         )
     if config.allow_tcp_forwarding:
         print(
-            "nookwire-ssh: --allow-tcp-forwarding set; clients may use "
+            "nookwire: --allow-tcp-forwarding set; clients may use "
             "ssh -L through this session",
             flush=True,
         )
@@ -830,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         config = build_config(parse_args(argv))
         asyncio.run(serve(config))
     except (OSError, ValueError, asyncssh.Error) as error:
-        print(f"nookwire-ssh: {error}", file=sys.stderr)
+        print(f"nookwire: {error}", file=sys.stderr)
         return 1
     return 0
 

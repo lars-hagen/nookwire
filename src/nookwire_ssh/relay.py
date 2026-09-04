@@ -27,7 +27,7 @@ CONNECT_KWARGS = dict(max_size=None, ping_interval=20, ping_timeout=20, close_ti
 
 
 def log(message):
-    sys.stderr.write("nookwire-ssh relay: " + message + "\n")
+    sys.stderr.write("nookwire relay: " + message + "\n")
     sys.stderr.flush()
 
 
